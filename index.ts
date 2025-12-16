@@ -79,7 +79,10 @@ class SafeClient {
 
 interface SafeObject {
     // id: any;
-    [key: string]: SafeField;
+    id: number;
+    fields: {
+        [key: string]: SafeField;
+    };
 }
 
 interface SafeField {
@@ -150,11 +153,11 @@ class Database {
         return new TextDecoder().decode(bytes);
     }
 
-    decryptObject(objectId: number, safeObject: SafeObject) {
+    decryptObject(safeObject: SafeObject) {
         const obj: any = {};
 
-        for (const [k, v] of Object.entries(safeObject)) {
-            const storedKey = this.getKey(objectId, k);
+        for (const [k, v] of Object.entries(safeObject.fields)) {
+            const storedKey = this.getKey(safeObject.id, k);
             if (!storedKey) {
                 throw new Error("No key found to decrypt " + k);
             }
@@ -165,7 +168,7 @@ class Database {
             if (requiredRotations > 0) {
                 console.log("Rotate key", requiredRotations, "while decrypting");
                 key = this.rotateKey(key, requiredRotations);
-                this.storeKey(objectId, k, key, v.version);
+                this.storeKey(safeObject.id, k, key, v.version);
             }
 
             const bytes = sodium.crypto_aead_chacha20poly1305_decrypt(null, v.cipher, null, v.nonce, key, "uint8array");
@@ -208,14 +211,14 @@ class Database {
         return key;
     }
 
-    patchObject(objectId: number, safeObject: SafeObject, data: object) {
+    patchObject(safeObject: SafeObject, data: object) {
         // const objectId = this.getObjectId(safeObject);
 
         for (const [k, v] of Object.entries(data)) {
-            const safeField = safeObject[k];
+            const safeField = safeObject.fields[k];
 
             if (safeField) {
-                const storedKey = this.getKey(objectId, k);
+                const storedKey = this.getKey(safeObject.id, k);
 
                 if (!storedKey) throw new Error("Key is required to patch object");
 
@@ -229,7 +232,7 @@ class Database {
                 safeField.version = newVersion;
                 safeField.cipher = sodium.crypto_aead_chacha20poly1305_encrypt(this.fieldToBytes(v), null, null, safeField.nonce, newKey);
 
-                this.storeKey(objectId, k, newKey, newVersion);
+                this.storeKey(safeObject.id, k, newKey, newVersion);
             } else {
                 const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
                 const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
@@ -238,7 +241,7 @@ class Database {
                 // const nonce = this.nonceToBytes(1);
                 const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(this.fieldToBytes(v), null, null, nonce, key);
 
-                safeObject[k] = {
+                safeObject.fields[k] = {
                     nonce: nonce,
                     version: 1,
                     cipher: cipher,
@@ -246,7 +249,7 @@ class Database {
 
                 console.log("New field key when patching", k);
 
-                this.storeKey(objectId, k, key, version);
+                this.storeKey(safeObject.id, k, key, version);
             }
         }
     }
@@ -334,30 +337,30 @@ async function databaseTest() {
     await db.init();
     console.log("Connected");
 
-    const safeObject: SafeObject = {};
+    const safeObject: SafeObject = { id: 12, fields: {} };
 
-    db.patchObject(12, safeObject, {
+    db.patchObject(safeObject, {
         firstName: "stijn",
         lastName: "rogiest",
         age: 20,
     });
 
-    db.patchObject(12, safeObject, {
+    db.patchObject(safeObject, {
         work: "programmer",
         firstName: "Stijn",
     });
 
-    db.patchObject(12, safeObject, {
+    db.patchObject(safeObject, {
         firstName: "Stijn2",
     });
 
-    db.patchObject(12, safeObject, {
+    db.patchObject(safeObject, {
         firstName: "Stijn4",
     });
 
-    console.log(db.decryptObject(12, safeObject));
+    console.log(db.decryptObject(safeObject));
 
-    Object.entries(safeObject).forEach(([k, v]) => {
+    Object.entries(safeObject.fields).forEach(([k, v]) => {
         console.log(
             k.padEnd(10, " "),
             "v" + v.version,
