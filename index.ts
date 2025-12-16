@@ -1,5 +1,6 @@
-import sodium from "libsodium-wrappers";
+import sodium, { from_string } from "libsodium-wrappers";
 import pg from "pg";
+import fs from "fs";
 
 let nonceCounter = 0;
 
@@ -123,6 +124,48 @@ class Database {
     //     await this.db.query("CREATE TABLE test (article_id bigserial primary key, article_name varchar(20) NOT NULL, article_desc text NOT NULL, date_added timestamp default NULL);");
     // }
 
+    async loadKeyStore() {
+        let str;
+        try {
+            str = fs.readFileSync("keystore", "utf-8");
+        } catch {
+            str = "";
+        }
+
+        const lines = str.split("\n");
+
+        this.keyStore = [];
+
+        for (const line of lines) {
+            const split = line.split(" ");
+            if (split.length != 4) continue;
+
+            const id = parseInt(split[0]!);
+            const field = split[1]!;
+            const version = parseInt(split[2]!);
+            const key = sodium.from_hex(split[3]!);
+
+            this.keyStore.push({
+                id: id,
+                field: field,
+                version: version,
+                key: key,
+            });
+        }
+
+        // this.keyStore = JSON.parse(fs.readFileSync("keystore.json", "utf-8")) as ObjectKeyStore[];
+    }
+
+    async saveKeyStore() {
+        const str = [] as string[];
+
+        for (const key of this.keyStore) {
+            str.push(`${key.id} ${key.field} ${key.version} ${sodium.to_hex(key.key)}`);
+        }
+
+        fs.writeFileSync("keystore", str.join("\n"), "utf-8");
+    }
+
     async init() {
         this.db = new pg.Client("postgresql://postgres:postgres@localhost:5432/safe?schema=public");
         await this.db.connect();
@@ -141,8 +184,8 @@ class Database {
         if (typeof v === "string") {
             return new TextEncoder().encode(v);
         } else if (typeof v === "number" && Math.floor(v) === v) {
-            const bytes = Buffer.alloc(4);
-            bytes.writeInt32LE(v);
+            const bytes = Buffer.alloc(8);
+            bytes.writeBigInt64LE(BigInt(v));
             return bytes;
         } else {
             throw new Error();
@@ -153,25 +196,36 @@ class Database {
         return new TextDecoder().decode(bytes);
     }
 
-    decryptObject(safeObject: SafeObject) {
+    async decryptObject(id: number) {
+        const rows = await this.db.query(`SELECT * FROM "encrypted" WHERE id = $1`, [id]);
+        const row = rows.rows[0];
+
+        if (!row) {
+            return null;
+        }
+
         const obj: any = {};
 
-        for (const [k, v] of Object.entries(safeObject.fields)) {
-            const storedKey = this.getKey(safeObject.id, k);
+        for (const [k, v] of Object.entries(row)) {
+            const storedKey = this.getKey(id, k);
             if (!storedKey) {
-                throw new Error("No key found to decrypt " + k);
+                console.warn("No key found to decrypt (" + id + "," + k + ")");
+                // throw new Error();
+                continue;
             }
+
+            const field = this.unpackField(v as Buffer);
 
             let key = storedKey.key;
 
-            const requiredRotations = v.version - storedKey.version;
+            const requiredRotations = field.version - storedKey.version;
             if (requiredRotations > 0) {
                 console.log("Rotate key", requiredRotations, "while decrypting");
                 key = this.rotateKey(key, requiredRotations);
-                this.storeKey(safeObject.id, k, key, v.version);
+                this.storeKey(id, k, key, field.version);
             }
 
-            const bytes = sodium.crypto_aead_chacha20poly1305_decrypt(null, v.cipher, null, v.nonce, key, "uint8array");
+            const bytes = sodium.crypto_aead_chacha20poly1305_decrypt(null, field.cipher, null, field.nonce, key, "uint8array");
 
             obj[k] = this.bytesToField(bytes);
         }
@@ -211,16 +265,53 @@ class Database {
         return key;
     }
 
-    patchObject(safeObject: SafeObject, data: object) {
+    unpackField(bytes: Buffer): SafeField {
+        const version = Number(bytes.readBigInt64LE(0));
+        const nonce = bytes.subarray(8, 8 + sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+        const cipher = bytes.subarray(8 + sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+        return { version, nonce, cipher };
+    }
+
+    packField(field: SafeField): Buffer {
+        const buffer = Buffer.alloc(8 + sodium.crypto_aead_chacha20poly1305_NPUBBYTES + field.cipher.byteLength);
+
+        buffer.writeBigInt64LE(BigInt(field.version), 0);
+
+        for (let i = 0; i < field.nonce.byteLength; i++) {
+            buffer[i + 8] = field.nonce[i]!;
+        }
+
+        for (let i = 0; i < field.cipher.byteLength; i++) {
+            buffer[i + 8 + sodium.crypto_aead_chacha20poly1305_NPUBBYTES] = field.cipher[i]!;
+        }
+
+        return buffer;
+    }
+
+    async patchObject(id: number, data: object) {
         // const objectId = this.getObjectId(safeObject);
 
-        for (const [k, v] of Object.entries(data)) {
-            const safeField = safeObject.fields[k];
+        const rows = await this.db.query(`SELECT * FROM "encrypted" WHERE id = $1`, [id]);
+        const row = rows.rows[0];
+        console.log("row", row);
 
-            if (safeField) {
-                const storedKey = this.getKey(safeObject.id, k);
+        const fieldValues: any = {};
+
+        for (const [k, v] of Object.entries(data)) {
+            // const safeField = safeObject.fields[k];
+
+            // const rows = await this.db.query(`SELECT * FROM "encrypted" WHERE id = $1`, [safeObject.id]);
+            // const row = rows.rows[0];
+            // console.log("rows", rows.rows);
+            // await this.db.query("BEGIN");
+
+            if (row && row[k]) {
+                const storedKey = this.getKey(id, k);
 
                 if (!storedKey) throw new Error("Key is required to patch object");
+
+                const safeField = this.unpackField(row[k]);
+                // console.log("safeField", safeField);
 
                 const rotateTimes = safeField.version - storedKey.version + 1;
                 const newVersion = storedKey.version + rotateTimes;
@@ -232,7 +323,9 @@ class Database {
                 safeField.version = newVersion;
                 safeField.cipher = sodium.crypto_aead_chacha20poly1305_encrypt(this.fieldToBytes(v), null, null, safeField.nonce, newKey);
 
-                this.storeKey(safeObject.id, k, newKey, newVersion);
+                fieldValues[k] = this.packField(safeField);
+
+                this.storeKey(id, k, newKey, newVersion);
             } else {
                 const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
                 const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
@@ -241,16 +334,61 @@ class Database {
                 // const nonce = this.nonceToBytes(1);
                 const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(this.fieldToBytes(v), null, null, nonce, key);
 
-                safeObject.fields[k] = {
+                const safeField = {
                     nonce: nonce,
                     version: 1,
                     cipher: cipher,
                 };
+                // safeObject.fields[k] = {
+                //     nonce: nonce,
+                //     version: 1,
+                //     cipher: cipher,
+                // };
 
                 console.log("New field key when patching", k);
 
-                this.storeKey(safeObject.id, k, key, version);
+                fieldValues[k] = this.packField(safeField);
+
+                this.storeKey(id, k, key, version);
             }
+        }
+
+        if (row) {
+            const sets: string[] = [];
+            const values: any[] = [];
+
+            values.push(id);
+
+            let i = 2;
+            for (const [k, v] of Object.entries(fieldValues)) {
+                sets.push(`"${k}" = $${i++}`);
+                values.push(v);
+            }
+
+            const query = `UPDATE "encrypted" SET ${sets.join(", ")} WHERE id = $1`;
+            console.log("query", query);
+
+            await this.db.query(query, values);
+        } else {
+            const fields: string[] = [];
+            const vals: string[] = [];
+            const values: any[] = [];
+
+            fields.push("id");
+            vals.push("$1");
+            values.push(id);
+
+            let i = 2;
+            for (const [k, v] of Object.entries(fieldValues)) {
+                fields.push(k);
+                vals.push("$" + i);
+                values.push(v);
+                i++;
+            }
+
+            const query = `INSERT INTO "encrypted"(${fields.join(", ")}) VALUES(${vals.join(", ")})`;
+            console.log("query", query);
+            await this.db.query(query, values);
         }
     }
 
@@ -335,45 +473,50 @@ access control fields:
 async function databaseTest() {
     const db = new Database();
     await db.init();
+    await db.loadKeyStore();
     console.log("Connected");
 
-    const safeObject: SafeObject = { id: 12, fields: {} };
+    // const safeObject: SafeObject = { id: 12, fields: {} };
 
-    db.patchObject(safeObject, {
-        firstName: "stijn",
-        lastName: "rogiest",
-        age: 20,
-    });
+    const id = 15;
 
-    db.patchObject(safeObject, {
-        work: "programmer",
-        firstName: "Stijn",
-    });
+    // await db.patchObject(id, {
+    //     title: "nieiuwe notitie",
+    //     author: "ik",
+    //     content: "dit is een test notitiedit is een test notitiedit is een test notitiedit is een test notitie",
+    //     createdat: new Date().getTime(),
+    // });
 
-    db.patchObject(safeObject, {
-        firstName: "Stijn2",
-    });
+    // db.patchObject(safeObject, {
+    //     work: "programmer",
+    //     firstName: "Stijn",
+    // });
 
-    db.patchObject(safeObject, {
-        firstName: "Stijn4",
-    });
+    // db.patchObject(safeObject, {
+    //     firstName: "Stijn2",
+    // });
 
-    console.log(db.decryptObject(safeObject));
+    // db.patchObject(safeObject, {
+    //     firstName: "Stijn4",
+    // });
 
-    Object.entries(safeObject.fields).forEach(([k, v]) => {
-        console.log(
-            k.padEnd(10, " "),
-            "v" + v.version,
-            "nonce=" + sodium.to_hex(v.nonce),
-            "cipher=" + sodium.to_hex(v.cipher),
-            "len=" + v.cipher.byteLength
-        );
-    });
+    console.log(await db.decryptObject(id));
 
-    db.keyStore.forEach((e) => {
-        console.log(e.id, e.field.padEnd(10, " "), "v" + e.version, "key=" + sodium.to_hex(e.key), "len=" + e.key.byteLength);
-    });
+    // Object.entries(safeObject.fields).forEach(([k, v]) => {
+    //     console.log(
+    //         k.padEnd(10, " "),
+    //         "v" + v.version,
+    //         "nonce=" + sodium.to_hex(v.nonce),
+    //         "cipher=" + sodium.to_hex(v.cipher),
+    //         "len=" + v.cipher.byteLength
+    //     );
+    // });
 
+    // db.keyStore.forEach((e) => {
+    //     console.log(e.id, e.field.padEnd(10, " "), "v" + e.version, "key=" + sodium.to_hex(e.key), "len=" + e.key.byteLength);
+    // });
+
+    await db.saveKeyStore();
     await db.close();
 }
 
