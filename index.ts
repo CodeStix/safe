@@ -84,7 +84,8 @@ interface SafeObject {
 
 interface SafeField {
     // key?: Uint8Array;
-    nonce: number;
+    version: number;
+    nonce: Uint8Array;
     cipher: Uint8Array;
 }
 
@@ -92,7 +93,8 @@ interface ObjectKeyStore {
     id: number;
     field: string;
     key: Uint8Array;
-    nonce: number;
+    version: number;
+    // nonce: number;
 }
 
 // class SafeObject {}
@@ -132,40 +134,6 @@ class Database {
         await this.db.end();
     }
 
-    // async createObject(tableName: string, data: object): Promise<SafeObject> {
-    //     let obj: SafeObject = {};
-
-    //     for (const [k, v] of Object.entries(data)) {
-    //         // Each cell gets a seperate key, nonce and ciphertext
-    //         const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
-
-    //         const nonce = 1;
-    //         const nonceBytes = this.nonceToBytes(nonce);
-
-    //         // let bytes;
-    //         // if (typeof v === "string") {
-    //         //     bytes = new TextEncoder().encode(v);
-    //         // } else if (typeof v === "number" && Math.floor(v) === v) {
-    //         //     bytes = Buffer.alloc(4);
-    //         //     bytes.writeInt32LE(v);
-    //         // } else {
-    //         //     throw new Error();
-    //         // }
-
-    //         const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(bytes, null, null, nonceBytes, key);
-
-    //         console.log(tableName, ":", k.padEnd(10, " "), "key", sodium.to_hex(key), "nonce", nonce, "cipher", sodium.to_hex(cipher));
-
-    //         obj[k] = {
-    //             cipher: cipher,
-    //             nonce: nonce,
-    //             key: key,
-    //         };
-    //     }
-
-    //     return obj;
-    // }
-
     fieldToBytes(v: any) {
         if (typeof v === "string") {
             return new TextEncoder().encode(v);
@@ -193,14 +161,14 @@ class Database {
 
             let key = storedKey.key;
 
-            const requiredRotations = v.nonce - storedKey.nonce;
+            const requiredRotations = v.version - storedKey.version;
             if (requiredRotations > 0) {
                 console.log("Rotate key", requiredRotations, "while decrypting");
                 key = this.rotateKey(key, requiredRotations);
-                this.storeKey(objectId, k, key, v.nonce);
+                this.storeKey(objectId, k, key, v.version);
             }
 
-            const bytes = sodium.crypto_aead_chacha20poly1305_decrypt(null, v.cipher, null, this.nonceToBytes(v.nonce), key, "uint8array");
+            const bytes = sodium.crypto_aead_chacha20poly1305_decrypt(null, v.cipher, null, v.nonce, key, "uint8array");
 
             obj[k] = this.bytesToField(bytes);
         }
@@ -212,17 +180,17 @@ class Database {
         return this.keyStore.find((e) => e.id === objectId && e.field === field);
     }
 
-    storeKey(objectId: number, field: string, key: Uint8Array, nonce: number) {
+    storeKey(objectId: number, field: string, key: Uint8Array, version: number) {
         const existingKey = this.getKey(objectId, field);
         if (existingKey != null) {
             existingKey.key = key;
-            existingKey.nonce = nonce;
+            existingKey.version = version;
         } else {
             this.keyStore.push({
                 field: field,
                 id: objectId,
                 key: key,
-                nonce: nonce,
+                version: version,
             });
         }
     }
@@ -251,44 +219,43 @@ class Database {
 
                 if (!storedKey) throw new Error("Key is required to patch object");
 
-                const rotateTimes = safeField.nonce - storedKey.nonce + 1;
-                const newNonce = storedKey.nonce + rotateTimes;
+                const rotateTimes = safeField.version - storedKey.version + 1;
+                const newVersion = storedKey.version + rotateTimes;
                 const newKey = this.rotateKey(storedKey.key, rotateTimes);
 
                 console.log("Rotate field key when patching", k, rotateTimes);
 
-                safeField.nonce = newNonce;
-                safeField.cipher = sodium.crypto_aead_chacha20poly1305_encrypt(
-                    this.fieldToBytes(v),
-                    null,
-                    null,
-                    this.nonceToBytes(safeField.nonce),
-                    newKey
-                );
+                this.incrementNonce(safeField.nonce);
+                safeField.version = newVersion;
+                safeField.cipher = sodium.crypto_aead_chacha20poly1305_encrypt(this.fieldToBytes(v), null, null, safeField.nonce, newKey);
 
-                this.storeKey(objectId, k, newKey, newNonce);
+                this.storeKey(objectId, k, newKey, newVersion);
             } else {
                 const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
-                const nonce = 1;
-                const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(this.fieldToBytes(v), null, null, this.nonceToBytes(nonce), key);
+                const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+
+                const version = 1;
+                // const nonce = this.nonceToBytes(1);
+                const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(this.fieldToBytes(v), null, null, nonce, key);
 
                 safeObject[k] = {
                     nonce: nonce,
+                    version: 1,
                     cipher: cipher,
                 };
 
                 console.log("New field key when patching", k);
 
-                this.storeKey(objectId, k, key, nonce);
+                this.storeKey(objectId, k, key, version);
             }
         }
     }
 
-    nonceToBytes(n: number) {
-        const nonce = new Uint8Array(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
-        const view = new DataView(nonce.buffer);
-        view.setBigUint64(0, BigInt(n)); // last 8 bytes
-        return nonce;
+    incrementNonce(nonceBytes: Uint8Array) {
+        if (nonceBytes.byteLength != 8) throw new Error("nonceBytes.byteLength != 8");
+
+        const view = new DataView(nonceBytes.buffer);
+        view.setBigUint64(0, view.getBigUint64(0) + 1n); // last 8 bytes
     }
 }
 
@@ -388,19 +355,20 @@ async function databaseTest() {
         firstName: "Stijn4",
     });
 
-    // db.decryptObject()
-
-    // const obj = await db.createObject("testing", {
-    //     firstName: "stijn",
-    //     lastName: "rogiest",
-    //     age: 20,
-    // });
-    // console.log(safeObject);
-
     console.log(db.decryptObject(12, safeObject));
 
+    Object.entries(safeObject).forEach(([k, v]) => {
+        console.log(
+            k.padEnd(10, " "),
+            "v" + v.version,
+            "nonce=" + sodium.to_hex(v.nonce),
+            "cipher=" + sodium.to_hex(v.cipher),
+            "len=" + v.cipher.byteLength
+        );
+    });
+
     db.keyStore.forEach((e) => {
-        console.log(e.id, e.field.padEnd(10, " "), e.nonce, sodium.to_hex(e.key), e.key.byteLength);
+        console.log(e.id, e.field.padEnd(10, " "), "v" + e.version, "key=" + sodium.to_hex(e.key), "len=" + e.key.byteLength);
     });
 
     await db.close();
