@@ -12,11 +12,13 @@
   "description": "",
   "devDependencies": {
     "@types/libsodium-wrappers": "^0.7.14",
+    "@types/pg": "^8.16.0",
     "nodemon": "^3.1.11",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "libsodium-wrappers": "^0.7.15"
+    "libsodium-wrappers": "^0.7.15",
+    "pg": "^8.16.3"
   }
 }

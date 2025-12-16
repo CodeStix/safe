@@ -1,4 +1,5 @@
 import sodium from "libsodium-wrappers";
+import pg from "pg";
 
 let nonceCounter = 0;
 
@@ -11,6 +12,18 @@ let nonceCounter = 0;
 // }
 
 // type SessionStart = sodium.KeyPair;
+
+// client.registrations.select("hallo", "yes", "please")
+
+// [cell] <-> [cellpolicy] <-> [group] <-> [groupidentity] <-> [identity]
+
+interface RowPolicy {
+    tableName: string;
+    rowId: number;
+    identityId: number;
+}
+
+interface Identity {}
 
 class SafeClient {
     public identityKeyPair: sodium.KeyPair;
@@ -64,6 +77,133 @@ class SafeClient {
     }
 }
 
+interface SafeObject {
+    [key: string]: SafeField;
+}
+
+interface SafeField {
+    key?: Uint8Array;
+    nonce: number;
+    cipher: Uint8Array;
+}
+
+class SafeObject {}
+
+class Database {
+    db!: pg.Client;
+
+    async checkTableExists(schemaName: string, tableName: string) {
+        const results = await this.db.query(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2) AS exists;",
+            [schemaName, tableName]
+        );
+
+        return results.rows[0].exists;
+    }
+
+    // async createTestTable() {
+    //     await this.db.query("CREATE TABLE test (article_id bigserial primary key, article_name varchar(20) NOT NULL, article_desc text NOT NULL, date_added timestamp default NULL);");
+    // }
+
+    async init() {
+        this.db = new pg.Client("postgresql://postgres:postgres@localhost:5432/safe?schema=public");
+        await this.db.connect();
+
+        // const exists = await this.checkTableExists();
+        // if (!exists) {
+        // }
+        // console.log({ exists });
+    }
+
+    async close() {
+        await this.db.end();
+    }
+
+    // async createObject(tableName: string, data: object): Promise<SafeObject> {
+    //     let obj: SafeObject = {};
+
+    //     for (const [k, v] of Object.entries(data)) {
+    //         // Each cell gets a seperate key, nonce and ciphertext
+    //         const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
+
+    //         const nonce = 1;
+    //         const nonceBytes = this.nonceToBytes(nonce);
+
+    //         // let bytes;
+    //         // if (typeof v === "string") {
+    //         //     bytes = new TextEncoder().encode(v);
+    //         // } else if (typeof v === "number" && Math.floor(v) === v) {
+    //         //     bytes = Buffer.alloc(4);
+    //         //     bytes.writeInt32LE(v);
+    //         // } else {
+    //         //     throw new Error();
+    //         // }
+
+    //         const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(bytes, null, null, nonceBytes, key);
+
+    //         console.log(tableName, ":", k.padEnd(10, " "), "key", sodium.to_hex(key), "nonce", nonce, "cipher", sodium.to_hex(cipher));
+
+    //         obj[k] = {
+    //             cipher: cipher,
+    //             nonce: nonce,
+    //             key: key,
+    //         };
+    //     }
+
+    //     return obj;
+    // }
+
+    fieldToBytes(v: any) {
+        if (typeof v === "string") {
+            return new TextEncoder().encode(v);
+        } else if (typeof v === "number" && Math.floor(v) === v) {
+            const bytes = Buffer.alloc(4);
+            bytes.writeInt32LE(v);
+            return bytes;
+        } else {
+            throw new Error();
+        }
+    }
+
+    async patchObject(safeObject: SafeObject, data: object) {
+        for (const [k, v] of Object.entries(data)) {
+            const safeField = safeObject[k];
+
+            if (safeField) {
+                if (!safeField.key) throw new Error("Key is required to patch object");
+
+                safeField.nonce += 1;
+                safeField.key = sodium.crypto_generichash(sodium.crypto_aead_chacha20poly1305_KEYBYTES, safeField.key, null);
+                safeField.cipher = sodium.crypto_aead_chacha20poly1305_encrypt(
+                    this.fieldToBytes(v),
+                    null,
+                    null,
+                    this.nonceToBytes(safeField.nonce),
+                    safeField.key
+                );
+            } else {
+                const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
+                const nonce = 1;
+                const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(this.fieldToBytes(v), null, null, this.nonceToBytes(nonce), key);
+
+                const safeField: SafeField = {
+                    key: key,
+                    nonce: nonce,
+                    cipher: cipher,
+                };
+                safeObject[k] = safeField;
+            }
+        }
+    }
+
+    nonceToBytes(n: number) {
+        const nonce = new Uint8Array(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+        const view = new DataView(nonce.buffer);
+        view.setBigUint64(0, BigInt(n)); // last 8 bytes
+        return nonce;
+    }
+}
+
 async function keyExchangeTest() {
     await sodium.ready;
 
@@ -77,7 +217,7 @@ async function keyExchangeTest() {
     clientB.endHandshake(handshakeA.signedSessionPublicKey, handshakeA.signature, handshakeA.identityPublicKey_TODO, false);
 }
 
-keyExchangeTest();
+// keyExchangeTest();
 
 function getNonce() {
     const counter = ++nonceCounter;
@@ -111,14 +251,7 @@ async function diffieHellmanKeyExchange() {
 
     console.time("Send/receive");
 
-    const message = sodium.crypto_aead_chacha20poly1305_encrypt(
-        "hallo joepie kjadfjkladfljkadfksjl",
-        null,
-        null,
-        nonce,
-        clientSharedSecret.sharedTx,
-        "uint8array"
-    );
+    const message = sodium.crypto_aead_chacha20poly1305_encrypt("", null, null, nonce, clientSharedSecret.sharedTx, "uint8array");
 
     console.log("encrypted", message);
 
@@ -140,3 +273,28 @@ access control fields:
 */
 
 // diffieHellmanKeyExchange();
+
+async function databaseTest() {
+    const db = new Database();
+    await db.init();
+    console.log("Connected");
+
+    const safeObject: SafeObject = {};
+
+    await db.patchObject(safeObject, {
+        firstName: "stijn",
+        lastName: "rogiest",
+        age: 20,
+    });
+
+    // const obj = await db.createObject("testing", {
+    //     firstName: "stijn",
+    //     lastName: "rogiest",
+    //     age: 20,
+    // });
+    console.log(safeObject);
+
+    await db.close();
+}
+
+databaseTest();
