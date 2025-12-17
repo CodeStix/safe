@@ -196,9 +196,30 @@ class Database {
         return new TextDecoder().decode(bytes);
     }
 
+    // async shareObject(id: number, fields: string[]) {
+    //     const rows = await this.db.query(`SELECT * FROM "encrypted" WHERE id = $1`, [id]);
+    //     const row = rows.rows[0];
+
+    //     if (!row) {
+    //         throw new Error("Object not found");
+    //     }
+
+    //     for (const k of fields) {
+    //         const storedKey = this.getKey(id, k);
+
+    //         // storedKey.
+
+    //         // const safeField = this.unpackField(row[k]);
+
+    //         // safeField.
+    //     }
+    // }
+
     async decryptObject(id: number) {
         const rows = await this.db.query(`SELECT * FROM "encrypted" WHERE id = $1`, [id]);
         const row = rows.rows[0];
+
+        // console.log("rows.fields", rows.fields);
 
         if (!row) {
             return null;
@@ -209,7 +230,7 @@ class Database {
         for (const [k, v] of Object.entries(row)) {
             const storedKey = this.getKey(id, k);
             if (!storedKey) {
-                console.warn("No key found to decrypt (" + id + "," + k + ")");
+                console.warn("No key found to decrypt", id, k);
                 // throw new Error();
                 continue;
             }
@@ -220,12 +241,22 @@ class Database {
 
             const requiredRotations = field.version - storedKey.version;
             if (requiredRotations > 0) {
-                console.log("Rotate key", requiredRotations, "while decrypting");
+                console.log("Rotate key", requiredRotations, "while decrypting", k);
                 key = this.rotateKey(key, requiredRotations);
                 this.storeKey(id, k, key, field.version);
+            } else if (requiredRotations < 0) {
+                console.error("Key is in past", k, field.version, storedKey.version);
+                continue;
             }
 
-            const bytes = sodium.crypto_aead_chacha20poly1305_decrypt(null, field.cipher, null, field.nonce, key, "uint8array");
+            let bytes;
+            try {
+                bytes = sodium.crypto_aead_chacha20poly1305_decrypt(null, field.cipher, null, field.nonce, key, "uint8array");
+            } catch (ex) {
+                console.error("Could not decrypt", id, k, String(ex));
+                continue;
+            }
+            console.log("Decrypt", k, "size", field.cipher.byteLength, "->", bytes.byteLength);
 
             obj[k] = this.bytesToField(bytes);
         }
@@ -308,9 +339,15 @@ class Database {
             if (row && row[k]) {
                 const storedKey = this.getKey(id, k);
 
-                if (!storedKey) throw new Error("Key is required to patch object");
+                if (!storedKey) {
+                    throw new Error("Key is required to patch object");
+                }
 
                 const safeField = this.unpackField(row[k]);
+
+                if (safeField.version < storedKey.version) {
+                    throw new Error("Stored version is older than newer");
+                }
                 // console.log("safeField", safeField);
 
                 const rotateTimes = safeField.version - storedKey.version + 1;
@@ -413,7 +450,7 @@ async function keyExchangeTest() {
     clientB.endHandshake(handshakeA.signedSessionPublicKey, handshakeA.signature, handshakeA.identityPublicKey_TODO, false);
 }
 
-// keyExchangeTest();
+keyExchangeTest();
 
 function getNonce() {
     const counter = ++nonceCounter;
@@ -481,10 +518,14 @@ async function databaseTest() {
     const id = 15;
 
     // await db.patchObject(id, {
-    //     title: "nieiuwe notitie",
+    //     title: "notitie #15",
     //     author: "ik",
     //     content: "dit is een test notitiedit is een test notitiedit is een test notitiedit is een test notitie",
     //     createdat: new Date().getTime(),
+    // });
+
+    // await db.patchObject(id, {
+    //     title: "notitie met id 15",
     // });
 
     // db.patchObject(safeObject, {
@@ -518,6 +559,8 @@ async function databaseTest() {
 
     await db.saveKeyStore();
     await db.close();
+
+    // console.log("key size", sodium.crypto_aead_chacha20poly1305_KEYBYTES);
 }
 
 databaseTest();
