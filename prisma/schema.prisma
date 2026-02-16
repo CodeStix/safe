@@ -1,0 +1,64 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider            = "prisma-client"
+  output              = "prisma"
+  moduleFormat        = "cjs"
+  importFileExtension = ""
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id          String @id @default(uuid())
+  email       String @unique
+  selfGroup   Group  @relation(fields: [selfGroupId], references: [id], name: "SelfUserGroup")
+  selfGroupId String @unique
+
+  groups GroupUserPermission[]
+
+  @@unique([id, selfGroupId])
+}
+
+model GroupUserPermission {
+  userId  String
+  user    User   @relation(fields: [userId], references: [id])
+  groupId String
+  group   Group  @relation(fields: [groupId], references: [id])
+
+  @@id([userId, groupId])
+}
+
+model Group {
+  id String @id @default(uuid())
+
+  selfUser User? @relation(name: "SelfUserGroup")
+
+  users   GroupUserPermission[]
+  objects ObjectGroupPermission[]
+}
+
+model ObjectGroupPermission {
+  groupId    String
+  group      Group   @relation(fields: [groupId], references: [id])
+  objectId   BigInt
+  object     Object  @relation(fields: [objectId], references: [id])
+  allowRead  Boolean @default(true)
+  allowWrite Boolean @default(true)
+
+  @@id([groupId, objectId])
+}
+
+model Object {
+  id      BigInt @id @default(autoincrement())
+  data    Bytes
+  version BigInt
+
+  groups ObjectGroupPermission[]
+}
