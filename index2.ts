@@ -1,4 +1,5 @@
 import "dotenv/config";
+import sodium from "libsodium-wrappers";
 import { WebSocket, WebSocketServer, RawData } from "ws";
 import { IncomingMessage } from "http";
 import { Object, PrismaClient } from "./prisma/prisma/client";
@@ -245,6 +246,23 @@ class SafeServer {
     }
 }
 
+function encodeBase64(bytes: Uint8Array): string {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]!);
+    }
+    return btoa(binary);
+}
+
+function decodeBase64(base64: string): Uint8Array {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
+
 class SafeClient {
     socket: WebSocket;
     responseHandlers = new Map<number, (msg: ClientMessage) => void>();
@@ -270,6 +288,13 @@ class SafeClient {
         }
     }
 
+    rotateKey(key: Uint8Array, times: number) {
+        for (let i = 0; i < times; i++) {
+            key = sodium.crypto_generichash(sodium.crypto_aead_chacha20poly1305_KEYBYTES, key, null);
+        }
+        return key;
+    }
+
     async authenticate(email: string) {
         await this.request({ type: "auth", email: email });
     }
@@ -290,11 +315,17 @@ class SafeClient {
         return res;
     }
 
-    async createRaw(data: Buffer): Promise<number> {
-        const res = await this.request({ type: "upsert", dataBase64: data.toString("base64") });
+    async createRaw(data: Uint8Array): Promise<number> {
+        // const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
+        // const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+        // const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, nonce, key);
+
+        const res = await this.request({ type: "upsert", dataBase64: encodeBase64(data) });
         if (res.type !== "upsert-response") {
             throw new Error();
         }
+
+        await sodium.ready;
 
         console.log("Create response", res);
         // TODO: increment local version and data
@@ -302,9 +333,11 @@ class SafeClient {
         return res.id;
     }
 
-    async updateRaw(id: number, data: Buffer) {
-        const res = await this.request({ type: "upsert", dataBase64: data.toString("base64"), id: id });
+    async updateRaw(id: number, data: Uint8Array) {
+        const res = await this.request({ type: "upsert", dataBase64: encodeBase64(data), id: id });
         console.log("Update response", res);
+
+        await sodium.ready;
 
         // TODO: increment local version and data
     }
@@ -315,9 +348,11 @@ class SafeClient {
             throw new Error();
         }
 
+        await sodium.ready;
+
         // TODO: increment local version and data
         if (res.dataBase64) {
-            const buf = Buffer.from(res.dataBase64, "base64");
+            const buf = decodeBase64(res.dataBase64);
 
             return buf;
         } else {
@@ -331,15 +366,16 @@ class SafeClient {
         if (!buf) {
             return null;
         }
-        return JSON.parse(buf.toString("utf-8")) as T;
+
+        return JSON.parse(new TextDecoder().decode(buf)) as T;
     }
 
     async create(data: any) {
-        return await this.createRaw(Buffer.from(JSON.stringify(data), "utf-8"));
+        return await this.createRaw(new TextEncoder().encode(JSON.stringify(data)));
     }
 
     async update(id: number, data: any) {
-        await this.updateRaw(id, Buffer.from(JSON.stringify(data), "utf-8"));
+        await this.updateRaw(id, new TextEncoder().encode(JSON.stringify(data)));
     }
 
     handleMessage(data: RawData, isBinary: boolean) {
