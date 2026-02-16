@@ -4,6 +4,8 @@ import { WebSocket, WebSocketServer, RawData } from "ws";
 import { IncomingMessage } from "http";
 import { Object, PrismaClient } from "./prisma/prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
+import AsyncLock from "async-lock";
+import { PrismaClientKnownRequestError } from "@prisma/client/runtime/client";
 
 type ServerMessage =
     | {
@@ -13,6 +15,7 @@ type ServerMessage =
     | {
           type: "upsert";
           id?: number | null;
+          version: number;
           dataBase64: string;
           nonceBase64: string;
       }
@@ -33,6 +36,11 @@ type ClientMessage =
           request: number;
           version: number;
           id: number;
+      }
+    | {
+          type: "upsert-invalid-version";
+          request: number;
+          version: number;
       }
     | {
           type: "get-response";
@@ -66,6 +74,7 @@ class SafeServer {
     socket: WebSocketServer;
     prisma: PrismaClient;
     userPerSocket = new Map<WebSocket, AuthenticatedUser>();
+    lock: AsyncLock;
 
     constructor() {
         this.socket = new WebSocketServer({ port: 8080 });
@@ -73,6 +82,8 @@ class SafeServer {
 
         const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! });
         this.prisma = new PrismaClient({ adapter });
+
+        this.lock = new AsyncLock();
     }
 
     handleConnection(ws: WebSocket, request: IncomingMessage) {
@@ -152,32 +163,79 @@ class SafeServer {
                 const data = Buffer.from(msg.dataBase64, "base64");
                 const nonce = Buffer.from(msg.nonceBase64, "base64");
 
-                let obj: Object;
+                let obj: Object | null = null;
                 if (typeof msg.id === "number") {
-                    obj = await this.prisma.object.update({
-                        where: {
-                            id: msg.id,
-                            groups: {
-                                some: {
-                                    allowWrite: true,
-                                    group: {
-                                        users: {
-                                            some: {
-                                                userId: user.id,
+                    // obj = await this.prisma.object.update({
+                    //     where: {
+                    //         id: msg.id!,
+                    //         version: msg.version,
+                    //         groups: {
+                    //             some: {
+                    //                 allowWrite: true,
+                    //                 group: {
+                    //                     users: {
+                    //                         some: {
+                    //                             userId: user.id,
+                    //                         },
+                    //                     },
+                    //                 },
+                    //             },
+                    //         },
+                    //     },
+                    //     data: {
+                    //         data: data,
+                    //         nonce: nonce,
+                    //         version: {
+                    //             increment: 1,
+                    //         },
+                    //     },
+                    // });
+
+                    const requiredVersion = await this.lock.acquire(String(msg.id), async () => {
+                        obj = await this.prisma.object.findUniqueOrThrow({
+                            where: {
+                                id: msg.id!,
+                                groups: {
+                                    some: {
+                                        allowWrite: true,
+                                        group: {
+                                            users: {
+                                                some: {
+                                                    userId: user.id,
+                                                },
                                             },
                                         },
                                     },
                                 },
                             },
-                        },
-                        data: {
-                            data: data,
-                            nonce: nonce,
-                            version: {
-                                increment: 1,
+                        });
+                        if (Number(obj.version) != msg.version) {
+                            return obj.version;
+                        }
+                        obj = await this.prisma.object.update({
+                            where: {
+                                id: obj.id,
                             },
-                        },
+                            data: {
+                                data: data,
+                                nonce: nonce,
+                                version: {
+                                    increment: 1,
+                                },
+                            },
+                        });
+                        return null;
                     });
+
+                    if (typeof requiredVersion === "number") {
+                        // Object is encrypted with the wrong key/nonce version
+                        wsUser.send({
+                            type: "upsert-invalid-version",
+                            request: msg.request,
+                            version: Number(requiredVersion),
+                        });
+                        break;
+                    }
                 } else {
                     obj = await this.prisma.object.create({
                         data: {
@@ -196,8 +254,8 @@ class SafeServer {
                 wsUser.send({
                     type: "upsert-response",
                     request: msg.request,
-                    version: Number(obj.version),
-                    id: Number(obj.id),
+                    version: Number(obj!.version),
+                    id: Number(obj!.id),
                 });
                 break;
             }
@@ -347,10 +405,13 @@ class SafeClient {
         const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
         const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, nonce, key);
 
+        console.log("Create key size", key.length, "nonce size", nonce.length);
+
         const res = await this.request({
             type: "upsert",
             dataBase64: encodeBase64(cipher),
             nonceBase64: encodeBase64(nonce),
+            version: 1,
         });
         if (res.type !== "upsert-response") {
             throw new Error();
@@ -386,19 +447,31 @@ class SafeClient {
 
         const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, newNonce, newKey);
 
-        const res = await this.request({ type: "upsert", dataBase64: encodeBase64(cipher), nonceBase64: encodeBase64(newNonce), id: id });
-        // console.log("Update response", res);
+        const res = await this.request({
+            type: "upsert",
+            dataBase64: encodeBase64(cipher),
+            nonceBase64: encodeBase64(newNonce),
+            version: key.version, // Pass current version
+            id: id,
+        });
 
-        if (res.type != "upsert-response") {
+        if (res.type === "upsert-invalid-version") {
+            console.log("Rotate key", res.version - key.version, "times");
+            await this.storeKey(id, {
+                key: rotateKey(newKey, res.version - key.version),
+                version: res.version,
+                nonce: newNonce,
+            });
+            await this.updateRaw(id, data);
+        } else if (res.type === "upsert-response") {
+            await this.storeKey(id, {
+                key: newKey,
+                nonce: newNonce,
+                version: res.version,
+            });
+        } else {
             throw new Error();
         }
-
-        this.storeKey(id, {
-            key: newKey,
-            nonce: newNonce,
-            version: res.version,
-        });
-        // TODO: increment local version and data
     }
 
     async getRaw(id: number) {
@@ -414,7 +487,6 @@ class SafeClient {
             throw new Error();
         }
 
-        // TODO: increment local version and data
         if (res.dataBase64 && res.nonceBase64 && res.version) {
             const cipher = decodeBase64(res.dataBase64);
             const nonce = decodeBase64(res.nonceBase64);
@@ -422,7 +494,7 @@ class SafeClient {
             let ciperKey = key.key;
 
             if (key.version != res.version) {
-                console.log("Rotate key", res.version - key.version);
+                console.log("Rotate key", res.version - key.version, "times");
                 ciperKey = rotateKey(ciperKey, res.version - key.version);
                 await this.storeKey(id, {
                     key: ciperKey,
@@ -485,21 +557,33 @@ async function main() {
 
     await client.authenticate("reddusted@gmail.com");
 
-    const id = 16;
+    let id = await client.create({ name: "Stijn Rogiest", age: 25 });
 
     let obj = await client.get<{ name: string; age: number }>(id);
-    if (!obj) {
-        console.log("creating object");
-        let id = await client.create({ name: "Rogiest", age: 250 });
-        console.log("created", id);
-    } else {
-        console.log("obj", obj);
-        obj = { ...obj, age: obj.age + 1 };
-        await client.update(id, obj);
+    console.log("obj", obj);
 
-        obj = await client.get<{ name: string; age: number }>(id);
-        console.log("updated", obj);
-    }
+    await client.update(id, { ...obj, age: 26 });
+    await client.update(id, { ...obj, age: 26 });
+    // await client.update(id, { ...obj, age: 26 });
+
+    obj = await client.get<{ name: string; age: number }>(id);
+    console.log("obj", obj);
+
+    // const id = 16;
+
+    // let obj = await client.get<{ name: string; age: number }>(id);
+    // if (!obj) {
+    //     console.log("creating object");
+    //     let id = await client.create({ name: "Rogiest", age: 250 });
+    //     console.log("created", id);
+    // } else {
+    //     console.log("obj", obj);
+    //     obj = { ...obj, age: obj.age + 1 };
+    //     await client.update(id, obj);
+
+    //     obj = await client.get<{ name: string; age: number }>(id);
+    //     console.log("updated", obj);
+    // }
 }
 
 main();
