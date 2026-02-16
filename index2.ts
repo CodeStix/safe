@@ -14,6 +14,7 @@ type ServerMessage =
           type: "upsert";
           id?: number | null;
           dataBase64: string;
+          nonceBase64: string;
       }
     | {
           type: "get";
@@ -37,6 +38,7 @@ type ClientMessage =
           type: "get-response";
           request: number;
           dataBase64?: string;
+          nonceBase64?: string;
           version?: number;
       }
     | {
@@ -148,6 +150,7 @@ class SafeServer {
                 }
 
                 const data = Buffer.from(msg.dataBase64, "base64");
+                const nonce = Buffer.from(msg.nonceBase64, "base64");
 
                 let obj: Object;
                 if (typeof msg.id === "number") {
@@ -169,6 +172,7 @@ class SafeServer {
                         },
                         data: {
                             data: data,
+                            nonce: nonce,
                             version: {
                                 increment: 1,
                             },
@@ -178,6 +182,7 @@ class SafeServer {
                     obj = await this.prisma.object.create({
                         data: {
                             data: data,
+                            nonce: nonce,
                             version: 1,
                             groups: {
                                 create: {
@@ -226,6 +231,7 @@ class SafeServer {
                         type: "get-response",
                         request: msg.request,
                         dataBase64: Buffer.from(obj.data).toString("base64"),
+                        nonceBase64: Buffer.from(obj.nonce).toString("base64"),
                         version: Number(obj.version),
                     });
                 } else {
@@ -263,9 +269,35 @@ function decodeBase64(base64: string): Uint8Array {
     return bytes;
 }
 
+function incrementNonce(nonce: Uint8Array): Uint8Array {
+    if (nonce.byteLength != 8) throw new Error("nonceBytes.byteLength != 8");
+
+    const newNonce = new Uint8Array(8);
+    const newNonceView = new DataView(newNonce.buffer);
+
+    const nonceView = new DataView(nonce.buffer);
+    newNonceView.setBigUint64(0, nonceView.getBigUint64(0) + 1n); // last 8 bytes
+
+    return newNonce;
+}
+
+function rotateKey(key: Uint8Array, times: number) {
+    for (let i = 0; i < times; i++) {
+        key = sodium.crypto_generichash(sodium.crypto_aead_chacha20poly1305_KEYBYTES, key, null);
+    }
+    return key;
+}
+
+type StoredKey = {
+    key: Uint8Array;
+    nonce: Uint8Array;
+    version: number;
+};
+
 class SafeClient {
     socket: WebSocket;
     responseHandlers = new Map<number, (msg: ClientMessage) => void>();
+    keyPerId = new Map<number, StoredKey>();
 
     static currentRequestId: number = 1;
 
@@ -286,13 +318,6 @@ class SafeClient {
         } else {
             this.socket.once("open", () => this.send(message));
         }
-    }
-
-    rotateKey(key: Uint8Array, times: number) {
-        for (let i = 0; i < times; i++) {
-            key = sodium.crypto_generichash(sodium.crypto_aead_chacha20poly1305_KEYBYTES, key, null);
-        }
-        return key;
     }
 
     async authenticate(email: string) {
@@ -316,45 +341,99 @@ class SafeClient {
     }
 
     async createRaw(data: Uint8Array): Promise<number> {
-        // const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
-        // const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
-        // const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, nonce, key);
+        await sodium.ready;
 
-        const res = await this.request({ type: "upsert", dataBase64: encodeBase64(data) });
+        const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
+        const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+        const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, nonce, key);
+
+        const res = await this.request({
+            type: "upsert",
+            dataBase64: encodeBase64(cipher),
+            nonceBase64: encodeBase64(nonce),
+        });
         if (res.type !== "upsert-response") {
             throw new Error();
         }
 
-        await sodium.ready;
-
-        console.log("Create response", res);
-        // TODO: increment local version and data
+        await this.storeKey(res.id, {
+            key: key,
+            nonce: nonce,
+            version: res.version,
+        });
 
         return res.id;
     }
 
-    async updateRaw(id: number, data: Uint8Array) {
-        const res = await this.request({ type: "upsert", dataBase64: encodeBase64(data), id: id });
-        console.log("Update response", res);
+    async getKey(id: number): Promise<StoredKey | undefined> {
+        return this.keyPerId.get(id);
+    }
 
+    async storeKey(id: number, key: StoredKey) {
+        this.keyPerId.set(id, key);
+    }
+
+    async updateRaw(id: number, data: Uint8Array) {
         await sodium.ready;
 
+        const key = await this.getKey(id);
+        if (!key) {
+            throw new Error("Cannot update, no key");
+        }
+
+        const newNonce = incrementNonce(key.nonce);
+        const newKey = rotateKey(key.key, 1);
+
+        const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, newNonce, newKey);
+
+        const res = await this.request({ type: "upsert", dataBase64: encodeBase64(cipher), nonceBase64: encodeBase64(newNonce), id: id });
+        // console.log("Update response", res);
+
+        if (res.type != "upsert-response") {
+            throw new Error();
+        }
+
+        this.storeKey(id, {
+            key: newKey,
+            nonce: newNonce,
+            version: res.version,
+        });
         // TODO: increment local version and data
     }
 
     async getRaw(id: number) {
+        await sodium.ready;
+
+        const key = await this.getKey(id);
+        if (!key) {
+            throw new Error("No key for " + id);
+        }
+
         const res = await this.request({ type: "get", id: id });
         if (res.type !== "get-response") {
             throw new Error();
         }
 
-        await sodium.ready;
-
         // TODO: increment local version and data
-        if (res.dataBase64) {
-            const buf = decodeBase64(res.dataBase64);
+        if (res.dataBase64 && res.nonceBase64 && res.version) {
+            const cipher = decodeBase64(res.dataBase64);
+            const nonce = decodeBase64(res.nonceBase64);
 
-            return buf;
+            let ciperKey = key.key;
+
+            if (key.version != res.version) {
+                console.log("Rotate key", res.version - key.version);
+                ciperKey = rotateKey(ciperKey, res.version - key.version);
+                await this.storeKey(id, {
+                    key: ciperKey,
+                    version: res.version,
+                    nonce: nonce,
+                });
+            }
+
+            const data = sodium.crypto_aead_chacha20poly1305_decrypt(null, cipher, null, nonce, ciperKey, "uint8array");
+
+            return data;
         } else {
             // Not found
             return null;
