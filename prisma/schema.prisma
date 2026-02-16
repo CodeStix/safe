@@ -56,10 +56,9 @@ model ObjectGroupPermission {
 }
 
 model Object {
-  id      BigInt @id @default(autoincrement())
-  data    Bytes
-  nonce   Bytes
-  version BigInt
+  id    BigInt @id @default(autoincrement())
+  data  Bytes
+  nonce Bytes
 
   groups ObjectGroupPermission[]
 }

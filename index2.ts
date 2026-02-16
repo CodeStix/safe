@@ -13,9 +13,13 @@ type ServerMessage =
           email: string;
       }
     | {
-          type: "upsert";
-          id?: number | null;
-          version: number;
+          type: "insert";
+          dataBase64: string;
+          nonceBase64: string;
+      }
+    | {
+          type: "update";
+          id: number;
           dataBase64: string;
           nonceBase64: string;
       }
@@ -32,22 +36,27 @@ type ClientMessage =
           request: number;
       }
     | {
-          type: "upsert-response";
+          type: "insert-response";
           request: number;
-          version: number;
+          //   version: number;
           id: number;
       }
     | {
-          type: "upsert-invalid-version";
+          type: "update-invalid-version";
           request: number;
-          version: number;
+          nonceBase64: string;
+          //   version: number;
+      }
+    | {
+          type: "update-response";
+          request: number;
       }
     | {
           type: "get-response";
           request: number;
           dataBase64?: string;
           nonceBase64?: string;
-          version?: number;
+          //   version?: number;
       }
     | {
           type: "error-response";
@@ -154,7 +163,7 @@ class SafeServer {
                 break;
             }
 
-            case "upsert": {
+            case "insert": {
                 if (!user) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
                     break;
@@ -163,100 +172,109 @@ class SafeServer {
                 const data = Buffer.from(msg.dataBase64, "base64");
                 const nonce = Buffer.from(msg.nonceBase64, "base64");
 
-                let obj: Object | null = null;
-                if (typeof msg.id === "number") {
-                    // obj = await this.prisma.object.update({
-                    //     where: {
-                    //         id: msg.id!,
-                    //         version: msg.version,
-                    //         groups: {
-                    //             some: {
-                    //                 allowWrite: true,
-                    //                 group: {
-                    //                     users: {
-                    //                         some: {
-                    //                             userId: user.id,
-                    //                         },
-                    //                     },
-                    //                 },
-                    //             },
-                    //         },
-                    //     },
-                    //     data: {
-                    //         data: data,
-                    //         nonce: nonce,
-                    //         version: {
-                    //             increment: 1,
-                    //         },
-                    //     },
-                    // });
+                const obj = await this.prisma.object.create({
+                    data: {
+                        data: data,
+                        nonce: nonce,
+                        groups: {
+                            create: {
+                                groupId: user.selfGroupId,
+                            },
+                        },
+                    },
+                });
 
-                    const requiredVersion = await this.lock.acquire(String(msg.id), async () => {
-                        obj = await this.prisma.object.findUniqueOrThrow({
-                            where: {
-                                id: msg.id!,
-                                groups: {
-                                    some: {
-                                        allowWrite: true,
-                                        group: {
-                                            users: {
-                                                some: {
-                                                    userId: user.id,
-                                                },
+                wsUser.send({
+                    type: "insert-response",
+                    request: msg.request,
+                    id: Number(obj.id),
+                });
+                break;
+            }
+
+            case "update": {
+                // obj = await this.prisma.object.update({
+                //     where: {
+                //         id: msg.id!,
+                //         version: msg.version,
+                //         groups: {
+                //             some: {
+                //                 allowWrite: true,
+                //                 group: {
+                //                     users: {
+                //                         some: {
+                //                             userId: user.id,
+                //                         },
+                //                     },
+                //                 },
+                //             },
+                //         },
+                //     },
+                //     data: {
+                //         data: data,
+                //         nonce: nonce,
+                //         version: {
+                //             increment: 1,
+                //         },
+                //     },
+                // });
+
+                await this.lock.acquire(String(msg.id), async () => {
+                    if (!user) {
+                        wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
+                        return;
+                    }
+
+                    const data = Buffer.from(msg.dataBase64, "base64");
+                    const nonce = Buffer.from(msg.nonceBase64, "base64");
+
+                    const existingObj = await this.prisma.object.findUniqueOrThrow({
+                        where: {
+                            id: msg.id!,
+                            groups: {
+                                some: {
+                                    allowWrite: true,
+                                    group: {
+                                        users: {
+                                            some: {
+                                                userId: user.id,
                                             },
                                         },
                                     },
                                 },
                             },
-                        });
-                        if (Number(obj.version) != msg.version) {
-                            return obj.version;
-                        }
-                        obj = await this.prisma.object.update({
-                            where: {
-                                id: obj.id,
-                            },
-                            data: {
-                                data: data,
-                                nonce: nonce,
-                                version: {
-                                    increment: 1,
-                                },
-                            },
-                        });
-                        return null;
+                        },
                     });
 
-                    if (typeof requiredVersion === "number") {
-                        // Object is encrypted with the wrong key/nonce version
+                    const existingNonceInt = nonceToInt(existingObj.nonce);
+                    const nonceInt = nonceToInt(nonce);
+                    if (nonceInt !== existingNonceInt + 1n) {
                         wsUser.send({
-                            type: "upsert-invalid-version",
+                            type: "update-invalid-version",
                             request: msg.request,
-                            version: Number(requiredVersion),
+                            nonceBase64: Buffer.from(existingObj.nonce).toString("base64"),
                         });
-                        break;
+                        return;
                     }
-                } else {
-                    obj = await this.prisma.object.create({
+
+                    await this.prisma.object.update({
+                        where: {
+                            id: existingObj.id,
+                        },
                         data: {
                             data: data,
                             nonce: nonce,
-                            version: 1,
-                            groups: {
-                                create: {
-                                    groupId: user.selfGroupId,
-                                },
-                            },
                         },
                     });
-                }
 
-                wsUser.send({
-                    type: "upsert-response",
-                    request: msg.request,
-                    version: Number(obj!.version),
-                    id: Number(obj!.id),
+                    wsUser.send({
+                        type: "update-response",
+                        request: msg.request,
+                    });
+
+                    return null;
                 });
+
                 break;
             }
 
@@ -290,7 +308,6 @@ class SafeServer {
                         request: msg.request,
                         dataBase64: Buffer.from(obj.data).toString("base64"),
                         nonceBase64: Buffer.from(obj.nonce).toString("base64"),
-                        version: Number(obj.version),
                     });
                 } else {
                     wsUser.send({
@@ -310,6 +327,37 @@ class SafeServer {
     }
 }
 
+const MASK64 = (1n << 64n) - 1n;
+
+function nonceToInt(nonce: Uint8Array): bigint {
+    if (nonce.length !== 8) {
+        throw new Error("Expected exactly 8 bytes");
+    }
+
+    let n = 0n;
+    for (const b of nonce) {
+        n = (n << 8n) | BigInt(b);
+    }
+    return n;
+}
+
+function intToNonce(n: bigint): Uint8Array {
+    const bytes = new Uint8Array(8);
+    for (let i = 7; i >= 0; i--) {
+        bytes[i] = Number(n & 0xffn);
+        n >>= 8n;
+    }
+    return bytes;
+}
+
+function incrementWithOverflow(a: bigint, b: bigint): bigint {
+    return (a + b) & MASK64;
+}
+
+function differenceWithOverflow(a: bigint, b: bigint): bigint {
+    return (a - b) & MASK64;
+}
+
 function encodeBase64(bytes: Uint8Array): string {
     let binary = "";
     for (let i = 0; i < bytes.length; i++) {
@@ -327,17 +375,17 @@ function decodeBase64(base64: string): Uint8Array {
     return bytes;
 }
 
-function incrementNonce(nonce: Uint8Array): Uint8Array {
-    if (nonce.byteLength != 8) throw new Error("nonceBytes.byteLength != 8");
+// function incrementNonce(nonce: Uint8Array): Uint8Array {
+//     if (nonce.byteLength != 8) throw new Error("nonceBytes.byteLength != 8");
 
-    const newNonce = new Uint8Array(8);
-    const newNonceView = new DataView(newNonce.buffer);
+//     const newNonce = new Uint8Array(8);
+//     const newNonceView = new DataView(newNonce.buffer);
 
-    const nonceView = new DataView(nonce.buffer);
-    newNonceView.setBigUint64(0, nonceView.getBigUint64(0) + 1n); // last 8 bytes
+//     const nonceView = new DataView(nonce.buffer);
+//     newNonceView.setBigUint64(0, nonceView.getBigUint64(0) + 1n); // last 8 bytes
 
-    return newNonce;
-}
+//     return newNonce;
+// }
 
 function rotateKey(key: Uint8Array, times: number) {
     for (let i = 0; i < times; i++) {
@@ -349,7 +397,7 @@ function rotateKey(key: Uint8Array, times: number) {
 type StoredKey = {
     key: Uint8Array;
     nonce: Uint8Array;
-    version: number;
+    // version: number;
 };
 
 class SafeClient {
@@ -403,24 +451,24 @@ class SafeClient {
 
         const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
         const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+
         const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, nonce, key);
 
-        console.log("Create key size", key.length, "nonce size", nonce.length);
+        console.log("Create key size", key.length, "nonce size", nonce.length, "nonce", nonceToInt(nonce));
 
         const res = await this.request({
-            type: "upsert",
+            type: "insert",
             dataBase64: encodeBase64(cipher),
             nonceBase64: encodeBase64(nonce),
-            version: 1,
+            // version: 1,
         });
-        if (res.type !== "upsert-response") {
+        if (res.type !== "insert-response") {
             throw new Error();
         }
 
         await this.storeKey(res.id, {
             key: key,
             nonce: nonce,
-            version: res.version,
         });
 
         return res.id;
@@ -442,35 +490,42 @@ class SafeClient {
             throw new Error("Cannot update, no key");
         }
 
-        const newNonce = incrementNonce(key.nonce);
-        const newKey = rotateKey(key.key, 1);
+        const clientNonce = nonceToInt(key.nonce);
 
-        const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, newNonce, newKey);
+        let newNonce = intToNonce(incrementWithOverflow(clientNonce, 1n));
+        let newKey = rotateKey(key.key, 1);
 
-        const res = await this.request({
-            type: "upsert",
-            dataBase64: encodeBase64(cipher),
-            nonceBase64: encodeBase64(newNonce),
-            version: key.version, // Pass current version
-            id: id,
-        });
+        while (true) {
+            const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, newNonce, newKey);
 
-        if (res.type === "upsert-invalid-version") {
-            console.log("Rotate key", res.version - key.version, "times");
-            await this.storeKey(id, {
-                key: rotateKey(newKey, res.version - key.version),
-                version: res.version,
-                nonce: newNonce,
+            const res = await this.request({
+                type: "update",
+                dataBase64: encodeBase64(cipher),
+                nonceBase64: encodeBase64(newNonce),
+                id: id,
             });
-            await this.updateRaw(id, data);
-        } else if (res.type === "upsert-response") {
-            await this.storeKey(id, {
-                key: newKey,
-                nonce: newNonce,
-                version: res.version,
-            });
-        } else {
-            throw new Error();
+
+            if (res.type === "update-invalid-version") {
+                const serverNonce = nonceToInt(decodeBase64(res.nonceBase64));
+
+                const keyRotateCount = differenceWithOverflow(serverNonce, clientNonce);
+                if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
+                    throw new Error("Client has newer key than server, shouldn't be possible");
+                }
+
+                console.log("Rotate key", keyRotateCount, "times in updateRaw", clientNonce, serverNonce);
+
+                newNonce = intToNonce(incrementWithOverflow(serverNonce, 1n));
+                newKey = rotateKey(newKey, Number(keyRotateCount));
+            } else if (res.type === "update-response") {
+                await this.storeKey(id, {
+                    key: newKey,
+                    nonce: newNonce,
+                });
+                break;
+            } else {
+                throw new Error();
+            }
         }
     }
 
@@ -487,18 +542,26 @@ class SafeClient {
             throw new Error();
         }
 
-        if (res.dataBase64 && res.nonceBase64 && res.version) {
+        if (res.dataBase64 && res.nonceBase64) {
             const cipher = decodeBase64(res.dataBase64);
             const nonce = decodeBase64(res.nonceBase64);
 
             let ciperKey = key.key;
 
-            if (key.version != res.version) {
-                console.log("Rotate key", res.version - key.version, "times");
-                ciperKey = rotateKey(ciperKey, res.version - key.version);
+            const clientNonce = nonceToInt(key.nonce);
+            const serverNonce = nonceToInt(nonce);
+
+            if (clientNonce != serverNonce) {
+                const keyRotateCount = differenceWithOverflow(serverNonce, clientNonce);
+                if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
+                    throw new Error("Client has newer key than server, shouldn't be possible");
+                }
+
+                console.log("Rotate key", keyRotateCount, "times in getRaw", clientNonce, serverNonce);
+
+                ciperKey = rotateKey(ciperKey, Number(keyRotateCount));
                 await this.storeKey(id, {
                     key: ciperKey,
-                    version: res.version,
                     nonce: nonce,
                 });
             }
@@ -563,11 +626,16 @@ async function main() {
     console.log("obj", obj);
 
     await client.update(id, { ...obj, age: 26 });
-    await client.update(id, { ...obj, age: 26 });
     // await client.update(id, { ...obj, age: 26 });
 
-    obj = await client.get<{ name: string; age: number }>(id);
-    console.log("obj", obj);
+    console.log(await client.get<{ name: string; age: number }>(id));
+    await client.update(id, { ...obj, age: 26 });
+    await client.update(id, { ...obj, age: 26 });
+    await client.update(id, { ...obj, age: 26 });
+    console.log(await client.get<{ name: string; age: number }>(id));
+    await client.update(id, { ...obj, age: 26 });
+    console.log(await client.get<{ name: string; age: number }>(id));
+    console.log(await client.get<{ name: string; age: number }>(id));
 
     // const id = 16;
 
