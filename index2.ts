@@ -39,6 +39,7 @@ type ServerMessage =
     | {
           type: "query";
           objectType: string;
+          query: Record<string, any>;
       };
 
 // type ServerRequestMessage = ServerMessage & { request: number };
@@ -76,6 +77,11 @@ type ClientMessage =
           type: "error-response";
           request: number;
           message: string;
+      }
+    | {
+          type: "query-response";
+          request: number;
+          data: [id: number, dataBase64?: string, nonceBase64?: string, publicData?: any][];
       };
 
 class AuthenticatedUser {
@@ -341,6 +347,68 @@ class SafeServer {
                 break;
             }
 
+            case "query": {
+                if (!user) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
+                    break;
+                }
+
+                const objectType = this.getType(msg.objectType);
+                if (!objectType) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
+                    break;
+                }
+
+                const queries = [] as { publicData: { path: string[]; equals: string } }[];
+                for (const [k, v] of Object.entries(msg.query)) {
+                    queries.push({ publicData: { path: [k], equals: v } });
+                }
+
+                const obj = await this.prisma.object.findMany({
+                    where: {
+                        type: objectType.name,
+                        groups: {
+                            some: {
+                                allowRead: true,
+                                group: {
+                                    users: {
+                                        some: {
+                                            userId: user.id,
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        AND: queries,
+                    },
+                    select: {
+                        id: true,
+                        data: true,
+                        nonce: true,
+                        publicData: true,
+                    },
+                });
+
+                const convertedData: [id: number, dataBase64?: string, nonceBase64?: string, publicData?: any][] = [];
+
+                for (const row of obj) {
+                    convertedData.push([
+                        Number(row.id),
+                        Buffer.from(row.data).toString("base64"),
+                        Buffer.from(row.nonce).toString("base64"),
+                        row.publicData,
+                    ]);
+                }
+
+                wsUser.send({
+                    type: "query-response",
+                    request: msg.request,
+                    data: convertedData,
+                });
+
+                break;
+            }
+
             case "get": {
                 if (!user) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
@@ -350,7 +418,7 @@ class SafeServer {
                 const objectType = this.getType(msg.objectType);
                 if (!objectType) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
-                    return;
+                    break;
                 }
 
                 const obj = await this.prisma.object.findUnique({
@@ -471,7 +539,18 @@ type StoredKey = {
     // version: number;
 };
 
-type GetSafeData<T> = T extends ObjectType<any, infer Private, infer Public> ? { private: Private; public: Public } : unknown;
+type GetSafeData<T> = T extends ObjectType<any, infer Private, infer Public> ? { private: Private; public: Public } : never;
+
+type SafeDataQuery<T> = T extends ObjectType<any, infer Private, infer Public>
+    ? {
+          public?: {
+              [K in keyof Public]: Public[K] extends string | number ? Public[K] : never;
+          };
+          private?: {
+              [K in keyof Private]: Private[K] extends string | number ? Private[K] : never;
+          };
+      }
+    : never;
 
 class SafeSettings<T> {
     objectTypes: Record<string, ObjectType>;
@@ -661,6 +740,13 @@ class SafeClient<T extends Record<string, ObjectType>> {
         }
     }
 
+    async queryRaw(type: string, publicQuery: Record<string, any>) {
+        const res = await this.request({ type: "query", objectType: type, query: publicQuery });
+        if (res.type !== "query-response") {
+            throw new Error();
+        }
+    }
+
     async getRaw(type: string, id: number) {
         await sodium.ready;
 
@@ -736,6 +822,8 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
         return { private: privateData, public: publicData } as GetSafeData<T[K]>;
     }
+
+    async query<K extends keyof T & string>(type: K, query: SafeDataQuery<T[K]>): Promise<GetSafeData<T[K]>[]> {}
 
     async create<K extends keyof T & string>(type: K, data: GetSafeData<T[K]>) {
         const objectType = this.getType(type);
@@ -823,6 +911,8 @@ function zodToType<K extends string, Schema extends z.ZodObject<{ public: z.ZodT
 }
 
 async function main() {
+    // const UserEmailContainer
+
     const User = z.object({
         public: z.object({
             email: z.string(),
@@ -859,6 +949,12 @@ async function main() {
     // client.registerType(zodToType("User", User));
 
     await client.authenticate("reddusted@gmail.com");
+
+    const users = await client.query("User", {
+        public: {
+            email: 123,
+        },
+    });
 
     let id = await client.create("User", {
         private: {
