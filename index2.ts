@@ -6,6 +6,10 @@ import { Object, PrismaClient } from "./prisma/prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import AsyncLock from "async-lock";
 import { PrismaClientKnownRequestError } from "@prisma/client/runtime/client";
+import { ObjectCreateInput } from "./prisma/prisma/models";
+import * as z from "zod";
+
+type ObjectTypeName = string;
 
 type ServerMessage =
     | {
@@ -14,18 +18,27 @@ type ServerMessage =
       }
     | {
           type: "insert";
+          objectType: ObjectTypeName;
           dataBase64: string;
           nonceBase64: string;
+          publicData: object | undefined;
       }
     | {
           type: "update";
           id: number;
-          dataBase64: string;
-          nonceBase64: string;
+          objectType: ObjectTypeName;
+          dataBase64?: string;
+          nonceBase64?: string;
+          publicData?: object | undefined;
       }
     | {
           type: "get";
           id: number;
+          objectType: ObjectTypeName;
+      }
+    | {
+          type: "query";
+          objectType: ObjectTypeName;
       };
 
 // type ServerRequestMessage = ServerMessage & { request: number };
@@ -56,6 +69,7 @@ type ClientMessage =
           request: number;
           dataBase64?: string;
           nonceBase64?: string;
+          publicData?: object | undefined;
           //   version?: number;
       }
     | {
@@ -79,11 +93,22 @@ class AuthenticatedUser {
     }
 }
 
+type ObjectValidator = (data: any) => any;
+
+type ObjectType = {
+    name: string;
+    privateDataMaxSize: number;
+    privateDataValidator: ObjectValidator;
+    publicDataValidator: ObjectValidator;
+    // publicDataTransformer?: ObjectValidator;
+};
+
 class SafeServer {
     socket: WebSocketServer;
     prisma: PrismaClient;
     userPerSocket = new Map<WebSocket, AuthenticatedUser>();
     lock: AsyncLock;
+    objectTypes = new Map<string, Omit<ObjectType, "privateDataValidator">>();
 
     constructor() {
         this.socket = new WebSocketServer({ port: 8080 });
@@ -93,6 +118,14 @@ class SafeServer {
         this.prisma = new PrismaClient({ adapter });
 
         this.lock = new AsyncLock();
+    }
+
+    registerType(type: Omit<ObjectType, "privateDataValidator">) {
+        this.objectTypes.set(type.name, type);
+    }
+
+    getType(typeName: ObjectTypeName) {
+        return this.objectTypes.get(typeName);
     }
 
     handleConnection(ws: WebSocket, request: IncomingMessage) {
@@ -169,13 +202,38 @@ class SafeServer {
                     break;
                 }
 
+                const objectType = this.getType(msg.objectType);
+                if (!objectType) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
+                    break;
+                }
+
                 const data = Buffer.from(msg.dataBase64, "base64");
                 const nonce = Buffer.from(msg.nonceBase64, "base64");
 
+                if (nonce.length !== 8 || data.length > objectType.privateDataMaxSize) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Invalid private data" });
+                    break;
+                }
+
+                let publicData: object | undefined = undefined;
+
+                if (typeof msg.publicData !== "undefined") {
+                    try {
+                        publicData = objectType.publicDataValidator(msg.publicData);
+                    } catch (ex) {
+                        console.error("Could not validate public data", ex);
+                        wsUser.send({ type: "error-response", request: msg.request, message: "Invalid public data" });
+                        break;
+                    }
+                }
+
                 const obj = await this.prisma.object.create({
                     data: {
+                        type: objectType.name,
                         data: data,
                         nonce: nonce,
+                        publicData: publicData,
                         groups: {
                             create: {
                                 groupId: user.selfGroupId,
@@ -193,44 +251,22 @@ class SafeServer {
             }
 
             case "update": {
-                // obj = await this.prisma.object.update({
-                //     where: {
-                //         id: msg.id!,
-                //         version: msg.version,
-                //         groups: {
-                //             some: {
-                //                 allowWrite: true,
-                //                 group: {
-                //                     users: {
-                //                         some: {
-                //                             userId: user.id,
-                //                         },
-                //                     },
-                //                 },
-                //             },
-                //         },
-                //     },
-                //     data: {
-                //         data: data,
-                //         nonce: nonce,
-                //         version: {
-                //             increment: 1,
-                //         },
-                //     },
-                // });
-
                 await this.lock.acquire(String(msg.id), async () => {
                     if (!user) {
                         wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
                         return;
                     }
 
-                    const data = Buffer.from(msg.dataBase64, "base64");
-                    const nonce = Buffer.from(msg.nonceBase64, "base64");
+                    const objectType = this.getType(msg.objectType);
+                    if (!objectType) {
+                        wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
+                        return;
+                    }
 
                     const existingObj = await this.prisma.object.findUniqueOrThrow({
                         where: {
                             id: msg.id!,
+                            type: objectType.name,
                             groups: {
                                 some: {
                                     allowWrite: true,
@@ -246,15 +282,39 @@ class SafeServer {
                         },
                     });
 
-                    const existingNonceInt = nonceToInt(existingObj.nonce);
-                    const nonceInt = nonceToInt(nonce);
-                    if (nonceInt !== existingNonceInt + 1n) {
-                        wsUser.send({
-                            type: "update-invalid-version",
-                            request: msg.request,
-                            nonceBase64: Buffer.from(existingObj.nonce).toString("base64"),
-                        });
-                        return;
+                    let data: Buffer<ArrayBuffer> | undefined = undefined;
+                    let nonce: Buffer<ArrayBuffer> | undefined = undefined;
+                    let publicData: object | undefined = undefined;
+
+                    if (msg.dataBase64 && msg.nonceBase64) {
+                        data = Buffer.from(msg.dataBase64, "base64");
+                        nonce = Buffer.from(msg.nonceBase64, "base64");
+
+                        if (nonce.length !== 8 || data.length > objectType.privateDataMaxSize) {
+                            wsUser.send({ type: "error-response", request: msg.request, message: "Invalid private data" });
+                            return;
+                        }
+
+                        const existingNonceInt = nonceToInt(existingObj.nonce);
+                        const nonceInt = nonceToInt(nonce);
+                        if (nonceInt !== existingNonceInt + 1n) {
+                            wsUser.send({
+                                type: "update-invalid-version",
+                                request: msg.request,
+                                nonceBase64: Buffer.from(existingObj.nonce).toString("base64"),
+                            });
+                            return;
+                        }
+                    }
+
+                    if (typeof msg.publicData !== "undefined") {
+                        try {
+                            publicData = objectType.publicDataValidator(msg.publicData);
+                        } catch (ex) {
+                            console.error("Could not validate public data", ex);
+                            wsUser.send({ type: "error-response", request: msg.request, message: "Invalid public data" });
+                            return;
+                        }
                     }
 
                     await this.prisma.object.update({
@@ -264,6 +324,7 @@ class SafeServer {
                         data: {
                             data: data,
                             nonce: nonce,
+                            publicData: publicData,
                         },
                     });
 
@@ -272,7 +333,7 @@ class SafeServer {
                         request: msg.request,
                     });
 
-                    return null;
+                    return;
                 });
 
                 break;
@@ -284,9 +345,16 @@ class SafeServer {
                     break;
                 }
 
+                const objectType = this.getType(msg.objectType);
+                if (!objectType) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
+                    return;
+                }
+
                 const obj = await this.prisma.object.findUnique({
                     where: {
                         id: msg.id,
+                        type: objectType.name,
                         groups: {
                             some: {
                                 allowRead: true,
@@ -308,6 +376,7 @@ class SafeServer {
                         request: msg.request,
                         dataBase64: Buffer.from(obj.data).toString("base64"),
                         nonceBase64: Buffer.from(obj.nonce).toString("base64"),
+                        publicData: obj.publicData as object,
                     });
                 } else {
                     wsUser.send({
@@ -350,11 +419,11 @@ function intToNonce(n: bigint): Uint8Array {
     return bytes;
 }
 
-function incrementWithOverflow(a: bigint, b: bigint): bigint {
+function increment64(a: bigint, b: bigint): bigint {
     return (a + b) & MASK64;
 }
 
-function differenceWithOverflow(a: bigint, b: bigint): bigint {
+function difference64(a: bigint, b: bigint): bigint {
     return (a - b) & MASK64;
 }
 
@@ -404,6 +473,7 @@ class SafeClient {
     socket: WebSocket;
     responseHandlers = new Map<number, (msg: ClientMessage) => void>();
     keyPerId = new Map<number, StoredKey>();
+    objectTypes = new Map<string, ObjectType>();
 
     static currentRequestId: number = 1;
 
@@ -411,6 +481,14 @@ class SafeClient {
         this.socket = new WebSocket(url);
         this.socket.on("open", this.handleConnected.bind(this));
         this.socket.on("message", this.handleMessage.bind(this));
+    }
+
+    registerType(type: ObjectType) {
+        this.objectTypes.set(type.name, type);
+    }
+
+    getType(typeName: string) {
+        return this.objectTypes.get(typeName);
     }
 
     handleConnected() {
@@ -446,20 +524,24 @@ class SafeClient {
         return res;
     }
 
-    async createRaw(data: Uint8Array): Promise<number> {
+    async createRaw(type: ObjectTypeName, privateData: Uint8Array, publicData: object | undefined): Promise<number> {
         await sodium.ready;
 
         const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
         const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
 
-        const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, nonce, key);
+        const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(privateData, null, null, nonce, key);
+
+        console.log("Encrypt", privateData.length, "->", cipher.length);
 
         console.log("Create key size", key.length, "nonce size", nonce.length, "nonce", nonceToInt(nonce));
 
         const res = await this.request({
             type: "insert",
+            objectType: type,
             dataBase64: encodeBase64(cipher),
             nonceBase64: encodeBase64(nonce),
+            publicData: publicData,
             // version: 1,
         });
         if (res.type !== "insert-response") {
@@ -482,7 +564,21 @@ class SafeClient {
         this.keyPerId.set(id, key);
     }
 
-    async updateRaw(id: number, data: Uint8Array) {
+    async updateRaw(type: ObjectTypeName, id: number, privateData: Uint8Array | undefined, publicData: object | undefined) {
+        if (typeof privateData === "undefined") {
+            if (typeof publicData === "undefined") {
+                throw new Error("updateRaw must specify privateData or publicData");
+            }
+
+            await this.request({
+                type: "update",
+                objectType: type,
+                publicData: publicData,
+                id: id,
+            });
+            return;
+        }
+
         await sodium.ready;
 
         const key = await this.getKey(id);
@@ -492,30 +588,34 @@ class SafeClient {
 
         const clientNonce = nonceToInt(key.nonce);
 
-        let newNonce = intToNonce(incrementWithOverflow(clientNonce, 1n));
+        let newNonce = intToNonce(increment64(clientNonce, 1n));
         let newKey = rotateKey(key.key, 1);
 
         while (true) {
-            const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(data, null, null, newNonce, newKey);
+            const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(privateData, null, null, newNonce, newKey);
+
+            console.log("Encrypt", privateData.length, "->", cipher.length);
 
             const res = await this.request({
                 type: "update",
+                objectType: type,
                 dataBase64: encodeBase64(cipher),
                 nonceBase64: encodeBase64(newNonce),
+                publicData: publicData,
                 id: id,
             });
 
             if (res.type === "update-invalid-version") {
                 const serverNonce = nonceToInt(decodeBase64(res.nonceBase64));
 
-                const keyRotateCount = differenceWithOverflow(serverNonce, clientNonce);
+                const keyRotateCount = difference64(serverNonce, clientNonce);
                 if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
                     throw new Error("Client has newer key than server, shouldn't be possible");
                 }
 
                 console.log("Rotate key", keyRotateCount, "times in updateRaw", clientNonce, serverNonce);
 
-                newNonce = intToNonce(incrementWithOverflow(serverNonce, 1n));
+                newNonce = intToNonce(increment64(serverNonce, 1n));
                 newKey = rotateKey(newKey, Number(keyRotateCount));
             } else if (res.type === "update-response") {
                 await this.storeKey(id, {
@@ -529,7 +629,7 @@ class SafeClient {
         }
     }
 
-    async getRaw(id: number) {
+    async getRaw(type: ObjectTypeName, id: number) {
         await sodium.ready;
 
         const key = await this.getKey(id);
@@ -537,7 +637,7 @@ class SafeClient {
             throw new Error("No key for " + id);
         }
 
-        const res = await this.request({ type: "get", id: id });
+        const res = await this.request({ type: "get", objectType: type, id: id });
         if (res.type !== "get-response") {
             throw new Error();
         }
@@ -552,7 +652,7 @@ class SafeClient {
             const serverNonce = nonceToInt(nonce);
 
             if (clientNonce != serverNonce) {
-                const keyRotateCount = differenceWithOverflow(serverNonce, clientNonce);
+                const keyRotateCount = difference64(serverNonce, clientNonce);
                 if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
                     throw new Error("Client has newer key than server, shouldn't be possible");
                 }
@@ -568,28 +668,89 @@ class SafeClient {
 
             const data = sodium.crypto_aead_chacha20poly1305_decrypt(null, cipher, null, nonce, ciperKey, "uint8array");
 
-            return data;
+            return { privateData: data, publicData: res.publicData };
         } else {
             // Not found
             return null;
         }
     }
 
-    async get<T>(id: number): Promise<T | null> {
-        const buf = await this.getRaw(id);
-        if (!buf) {
+    async get(type: ObjectTypeName, id: number): Promise<{ private: any; public: any } | null> {
+        const objectType = this.getType(type);
+        if (!objectType) {
+            throw new Error("Unknown type " + type);
+        }
+
+        const objData = await this.getRaw(type, id);
+        if (!objData) {
             return null;
         }
 
-        return JSON.parse(new TextDecoder().decode(buf)) as T;
+        let privateData = JSON.parse(new TextDecoder().decode(objData.privateData));
+
+        try {
+            privateData = objectType.privateDataValidator(privateData);
+        } catch (ex) {
+            throw new Error("Could not validate private data: " + String(ex));
+        }
+
+        // Make sure to validate public data (actually only done to run transformers)
+        let publicData = objData.publicData;
+        try {
+            publicData = objectType.publicDataValidator(publicData);
+        } catch (ex) {
+            throw new Error("Could not validate public data: " + String(ex));
+        }
+
+        return { private: privateData, public: publicData };
     }
 
-    async create(data: any) {
-        return await this.createRaw(new TextEncoder().encode(JSON.stringify(data)));
+    async create(type: ObjectTypeName, privateData: object, publicData?: object | undefined) {
+        const objectType = this.getType(type);
+        if (!objectType) {
+            throw new Error("Unknown type " + type);
+        }
+
+        try {
+            privateData = objectType.privateDataValidator(privateData);
+        } catch (ex) {
+            throw new Error("Could not validate private data: " + String(ex));
+        }
+
+        if (typeof publicData !== "undefined") {
+            try {
+                publicData = objectType.publicDataValidator(publicData);
+            } catch (ex) {
+                throw new Error("Could not validate public data: " + String(ex));
+            }
+        }
+
+        return await this.createRaw(type, new TextEncoder().encode(JSON.stringify(privateData)), publicData);
     }
 
-    async update(id: number, data: any) {
-        await this.updateRaw(id, new TextEncoder().encode(JSON.stringify(data)));
+    async update(type: ObjectTypeName, id: number, privateData: object | undefined, publicData?: object | undefined) {
+        const objectType = this.getType(type);
+        if (!objectType) {
+            throw new Error("Unknown type " + type);
+        }
+
+        if (typeof privateData !== "undefined") {
+            try {
+                privateData = objectType.privateDataValidator(privateData);
+            } catch (ex) {
+                throw new Error("Could not validate private data: " + String(ex));
+            }
+        }
+
+        if (typeof publicData !== "undefined") {
+            try {
+                publicData = objectType.publicDataValidator(publicData);
+            } catch (ex) {
+                throw new Error("Could not validate public data: " + String(ex));
+            }
+        }
+
+        await this.updateRaw(type, id, new TextEncoder().encode(JSON.stringify(privateData)), publicData);
     }
 
     handleMessage(data: RawData, isBinary: boolean) {
@@ -613,45 +774,49 @@ class SafeClient {
     // handleOpen()
 }
 
+const User = z.object({
+    public: z.object({
+        email: z.string(),
+    }),
+    private: z.object({
+        name: z.string(),
+        age: z.number(),
+    }),
+});
+
+function zodToType(typeName: string, schema: z.ZodObject<{ public: z.ZodType; private: z.ZodType }>): ObjectType {
+    return {
+        name: typeName,
+        privateDataMaxSize: 100,
+        privateDataValidator: schema.shape.private.parse,
+        publicDataValidator: schema.shape.public.parse,
+        // publicDataTransformer: schema.shape.public.transform,
+    };
+}
+
 async function main() {
     const server = new SafeServer();
+    server.registerType(zodToType("User", User));
+
+    // User.
+
+    // let a: z.input<typeof Person>["name"]
 
     const client = new SafeClient("ws://localhost:8080");
+    client.registerType(zodToType("User", User));
 
     await client.authenticate("reddusted@gmail.com");
 
-    let id = await client.create({ name: "Stijn Rogiest", age: 25 });
+    let id = await client.create("User", { name: "Stijn Rogiest", age: 25 }, { email: "reddusted@gmail.com" });
 
-    let obj = await client.get<{ name: string; age: number }>(id);
-    console.log("obj", obj);
+    let obj = await client.get("User", id);
+    // console.log("obj", obj);
 
-    await client.update(id, { ...obj, age: 26 });
-    // await client.update(id, { ...obj, age: 26 });
+    await client.update("User", id, { name: obj!.private.name + "!!!!", age: obj!.private.age + 1 }, { email: "reddusted200@gmail.com" });
 
-    console.log(await client.get<{ name: string; age: number }>(id));
-    await client.update(id, { ...obj, age: 26 });
-    await client.update(id, { ...obj, age: 26 });
-    await client.update(id, { ...obj, age: 26 });
-    console.log(await client.get<{ name: string; age: number }>(id));
-    await client.update(id, { ...obj, age: 26 });
-    console.log(await client.get<{ name: string; age: number }>(id));
-    console.log(await client.get<{ name: string; age: number }>(id));
+    // obj = await client.get("User", id);
 
-    // const id = 16;
-
-    // let obj = await client.get<{ name: string; age: number }>(id);
-    // if (!obj) {
-    //     console.log("creating object");
-    //     let id = await client.create({ name: "Rogiest", age: 250 });
-    //     console.log("created", id);
-    // } else {
-    //     console.log("obj", obj);
-    //     obj = { ...obj, age: obj.age + 1 };
-    //     await client.update(id, obj);
-
-    //     obj = await client.get<{ name: string; age: number }>(id);
-    //     console.log("updated", obj);
-    // }
+    await client.update("User", id, { ...obj!.private, age: obj!.private.age + 1 });
 }
 
 main();

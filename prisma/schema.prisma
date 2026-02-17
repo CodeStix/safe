@@ -20,6 +20,7 @@ model User {
   email       String @unique
   selfGroup   Group  @relation(fields: [selfGroupId], references: [id], name: "SelfUserGroup")
   selfGroupId String @unique
+  // admin       Boolean @default(false) // Admins are allowed to create new object types
 
   groups GroupUserPermission[]
 
@@ -56,9 +57,24 @@ model ObjectGroupPermission {
 }
 
 model Object {
-  id    BigInt @id @default(autoincrement())
-  data  Bytes
-  nonce Bytes
+  id         BigInt @id @default(autoincrement())
+  type       String // User specified type of the object, eg "ShoppingItem", "UserProfile"
+  data       Bytes
+  nonce      Bytes
+  publicData Json?
 
   groups ObjectGroupPermission[]
+  // objectType ObjectType              @relation(fields: [type], references: [type])
+
+  // @@index([publicData]) // Will only work for operations on the whole json
+  @@index([type])
 }
+
+// model ObjectType {
+//   id                 Int    @id @default(autoincrement())
+//   type               String @unique
+//   maxPrivateDataSize Int
+//   publicDataSchema   String
+
+//   objects Object[]
+// }
