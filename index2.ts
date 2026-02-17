@@ -2,14 +2,14 @@ import "dotenv/config";
 import sodium from "libsodium-wrappers";
 import { WebSocket, WebSocketServer, RawData } from "ws";
 import { IncomingMessage } from "http";
-import { Object, PrismaClient } from "./prisma/prisma/client";
+import { PrismaClient } from "./prisma/prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import AsyncLock from "async-lock";
 import { PrismaClientKnownRequestError } from "@prisma/client/runtime/client";
 import { ObjectCreateInput } from "./prisma/prisma/models";
 import * as z from "zod";
 
-type ObjectTypeName = string;
+// type ObjectTypeName = string;
 
 type ServerMessage =
     | {
@@ -18,27 +18,27 @@ type ServerMessage =
       }
     | {
           type: "insert";
-          objectType: ObjectTypeName;
+          objectType: string;
           dataBase64: string;
           nonceBase64: string;
-          publicData: object | undefined;
+          publicData: any;
       }
     | {
           type: "update";
           id: number;
-          objectType: ObjectTypeName;
+          objectType: string;
           dataBase64?: string;
           nonceBase64?: string;
-          publicData?: object | undefined;
+          publicData?: any;
       }
     | {
           type: "get";
           id: number;
-          objectType: ObjectTypeName;
+          objectType: string;
       }
     | {
           type: "query";
-          objectType: ObjectTypeName;
+          objectType: string;
       };
 
 // type ServerRequestMessage = ServerMessage & { request: number };
@@ -69,7 +69,7 @@ type ClientMessage =
           request: number;
           dataBase64?: string;
           nonceBase64?: string;
-          publicData?: object | undefined;
+          publicData?: any;
           //   version?: number;
       }
     | {
@@ -93,13 +93,13 @@ class AuthenticatedUser {
     }
 }
 
-type ObjectValidator = (data: any) => any;
+type ObjectValidator<T> = (data: unknown) => unknown;
 
-type ObjectType = {
-    name: string;
+type ObjectType<K extends string = string, Private = any, Public = any> = {
+    name: K;
     privateDataMaxSize: number;
-    privateDataValidator: ObjectValidator;
-    publicDataValidator: ObjectValidator;
+    privateDataValidator: ObjectValidator<Private>;
+    publicDataValidator: ObjectValidator<Public>;
     // publicDataTransformer?: ObjectValidator;
 };
 
@@ -110,7 +110,7 @@ class SafeServer {
     lock: AsyncLock;
     objectTypes = new Map<string, Omit<ObjectType, "privateDataValidator">>();
 
-    constructor() {
+    constructor(settings: SafeSettings<any>) {
         this.socket = new WebSocketServer({ port: 8080 });
         this.socket.on("connection", this.handleConnection.bind(this));
 
@@ -118,13 +118,15 @@ class SafeServer {
         this.prisma = new PrismaClient({ adapter });
 
         this.lock = new AsyncLock();
+
+        this.objectTypes = new Map(Object.entries(settings.objectTypes));
     }
 
-    registerType(type: Omit<ObjectType, "privateDataValidator">) {
-        this.objectTypes.set(type.name, type);
-    }
+    // registerType(type: Omit<ObjectType, "privateDataValidator">) {
+    //     this.objectTypes.set(type.name, type);
+    // }
 
-    getType(typeName: ObjectTypeName) {
+    getType(typeName: string) {
         return this.objectTypes.get(typeName);
     }
 
@@ -216,7 +218,7 @@ class SafeServer {
                     break;
                 }
 
-                let publicData: object | undefined = undefined;
+                let publicData: any | undefined = undefined;
 
                 if (typeof msg.publicData !== "undefined") {
                     try {
@@ -284,7 +286,7 @@ class SafeServer {
 
                     let data: Buffer<ArrayBuffer> | undefined = undefined;
                     let nonce: Buffer<ArrayBuffer> | undefined = undefined;
-                    let publicData: object | undefined = undefined;
+                    let publicData: any | undefined = undefined;
 
                     if (msg.dataBase64 && msg.nonceBase64) {
                         data = Buffer.from(msg.dataBase64, "base64");
@@ -469,7 +471,35 @@ type StoredKey = {
     // version: number;
 };
 
-class SafeClient {
+type GetSafeData<T> = T extends ObjectType<any, infer Private, infer Public> ? { private: Private; public: Public } : unknown;
+
+class SafeSettings<T> {
+    objectTypes: Record<string, ObjectType>;
+
+    constructor(objectTypes?: Record<string, ObjectType>) {
+        this.objectTypes = objectTypes ?? {};
+    }
+
+    withType<K extends string, Private, Public>(
+        objectType: ObjectType<K, Private, Public>
+    ): SafeSettings<
+        T & {
+            [P in K]: ObjectType<P, Private, Public>;
+        }
+    > {
+        return new SafeSettings({
+            ...this.objectTypes,
+            [objectType.name]: objectType,
+        });
+    }
+
+    set<K extends keyof T>(t: K, data: GetSafeData<T[K]>) {}
+}
+
+// const f = new SafeSettings().withType(zodToType("User", User)).withType(zodToType("Profile", Profile));
+// f.set("User");
+
+class SafeClient<T extends Record<string, ObjectType>> {
     socket: WebSocket;
     responseHandlers = new Map<number, (msg: ClientMessage) => void>();
     keyPerId = new Map<number, StoredKey>();
@@ -477,15 +507,17 @@ class SafeClient {
 
     static currentRequestId: number = 1;
 
-    constructor(url: string) {
+    constructor(url: string, settings: SafeSettings<T>) {
+        this.objectTypes = new Map(Object.entries(settings.objectTypes));
+
         this.socket = new WebSocket(url);
         this.socket.on("open", this.handleConnected.bind(this));
         this.socket.on("message", this.handleMessage.bind(this));
     }
 
-    registerType(type: ObjectType) {
-        this.objectTypes.set(type.name, type);
-    }
+    // registerType(type: ObjectType) {
+    //     this.objectTypes.set(type.name, type);
+    // }
 
     getType(typeName: string) {
         return this.objectTypes.get(typeName);
@@ -524,7 +556,7 @@ class SafeClient {
         return res;
     }
 
-    async createRaw(type: ObjectTypeName, privateData: Uint8Array, publicData: object | undefined): Promise<number> {
+    async createRaw(typeName: string, privateData: Uint8Array, publicData: any | undefined): Promise<number> {
         await sodium.ready;
 
         const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
@@ -538,7 +570,7 @@ class SafeClient {
 
         const res = await this.request({
             type: "insert",
-            objectType: type,
+            objectType: typeName,
             dataBase64: encodeBase64(cipher),
             nonceBase64: encodeBase64(nonce),
             publicData: publicData,
@@ -564,7 +596,7 @@ class SafeClient {
         this.keyPerId.set(id, key);
     }
 
-    async updateRaw(type: ObjectTypeName, id: number, privateData: Uint8Array | undefined, publicData: object | undefined) {
+    async updateRaw(type: string, id: number, privateData: Uint8Array | undefined, publicData: any | undefined) {
         if (typeof privateData === "undefined") {
             if (typeof publicData === "undefined") {
                 throw new Error("updateRaw must specify privateData or publicData");
@@ -629,7 +661,7 @@ class SafeClient {
         }
     }
 
-    async getRaw(type: ObjectTypeName, id: number) {
+    async getRaw(type: string, id: number) {
         await sodium.ready;
 
         const key = await this.getKey(id);
@@ -668,14 +700,14 @@ class SafeClient {
 
             const data = sodium.crypto_aead_chacha20poly1305_decrypt(null, cipher, null, nonce, ciperKey, "uint8array");
 
-            return { privateData: data, publicData: res.publicData };
+            return { private: data, public: res.publicData };
         } else {
             // Not found
             return null;
         }
     }
 
-    async get(type: ObjectTypeName, id: number): Promise<{ private: any; public: any } | null> {
+    async get<K extends keyof T & string>(type: K, id: number): Promise<GetSafeData<T[K]> | null> {
         const objectType = this.getType(type);
         if (!objectType) {
             throw new Error("Unknown type " + type);
@@ -686,7 +718,7 @@ class SafeClient {
             return null;
         }
 
-        let privateData = JSON.parse(new TextDecoder().decode(objData.privateData));
+        let privateData = JSON.parse(new TextDecoder().decode(objData.private));
 
         try {
             privateData = objectType.privateDataValidator(privateData);
@@ -695,31 +727,33 @@ class SafeClient {
         }
 
         // Make sure to validate public data (actually only done to run transformers)
-        let publicData = objData.publicData;
+        let publicData = objData.public;
         try {
             publicData = objectType.publicDataValidator(publicData);
         } catch (ex) {
             throw new Error("Could not validate public data: " + String(ex));
         }
 
-        return { private: privateData, public: publicData };
+        return { private: privateData, public: publicData } as GetSafeData<T[K]>;
     }
 
-    async create(type: ObjectTypeName, privateData: object, publicData?: object | undefined) {
+    async create<K extends keyof T & string>(type: K, data: GetSafeData<T[K]>) {
         const objectType = this.getType(type);
         if (!objectType) {
             throw new Error("Unknown type " + type);
         }
 
+        let privateData: any;
         try {
-            privateData = objectType.privateDataValidator(privateData);
+            privateData = objectType.privateDataValidator(data.private);
         } catch (ex) {
             throw new Error("Could not validate private data: " + String(ex));
         }
 
-        if (typeof publicData !== "undefined") {
+        let publicData: any | undefined = undefined;
+        if (typeof data.public !== "undefined") {
             try {
-                publicData = objectType.publicDataValidator(publicData);
+                publicData = objectType.publicDataValidator(data.public);
             } catch (ex) {
                 throw new Error("Could not validate public data: " + String(ex));
             }
@@ -728,29 +762,31 @@ class SafeClient {
         return await this.createRaw(type, new TextEncoder().encode(JSON.stringify(privateData)), publicData);
     }
 
-    async update(type: ObjectTypeName, id: number, privateData: object | undefined, publicData?: object | undefined) {
+    async update<K extends keyof T & string>(type: K, id: number, data: Partial<GetSafeData<T[K]>>) {
         const objectType = this.getType(type);
         if (!objectType) {
             throw new Error("Unknown type " + type);
         }
 
-        if (typeof privateData !== "undefined") {
+        let privateData: any | undefined = undefined;
+        if (typeof data.private !== "undefined") {
             try {
-                privateData = objectType.privateDataValidator(privateData);
+                privateData = objectType.privateDataValidator(data.private);
             } catch (ex) {
                 throw new Error("Could not validate private data: " + String(ex));
             }
         }
 
-        if (typeof publicData !== "undefined") {
+        let publicData: any | undefined = undefined;
+        if (typeof data.public !== "undefined") {
             try {
-                publicData = objectType.publicDataValidator(publicData);
+                publicData = objectType.publicDataValidator(data.public);
             } catch (ex) {
                 throw new Error("Could not validate public data: " + String(ex));
             }
         }
 
-        await this.updateRaw(type, id, new TextEncoder().encode(JSON.stringify(privateData)), publicData);
+        await this.updateRaw(type, id, privateData === undefined ? undefined : new TextEncoder().encode(JSON.stringify(privateData)), publicData);
     }
 
     handleMessage(data: RawData, isBinary: boolean) {
@@ -774,49 +810,82 @@ class SafeClient {
     // handleOpen()
 }
 
-const User = z.object({
-    public: z.object({
-        email: z.string(),
-    }),
-    private: z.object({
-        name: z.string(),
-        age: z.number(),
-    }),
-});
-
-function zodToType(typeName: string, schema: z.ZodObject<{ public: z.ZodType; private: z.ZodType }>): ObjectType {
+function zodToType<K extends string, Schema extends z.ZodObject<{ public: z.ZodType; private: z.ZodType }>>(
+    typeName: K,
+    schema: Schema
+): ObjectType<K, ReturnType<Schema["shape"]["private"]["parse"]>, ReturnType<Schema["shape"]["public"]["parse"]>> {
     return {
         name: typeName,
         privateDataMaxSize: 100,
         privateDataValidator: schema.shape.private.parse,
         publicDataValidator: schema.shape.public.parse,
-        // publicDataTransformer: schema.shape.public.transform,
     };
 }
 
 async function main() {
-    const server = new SafeServer();
-    server.registerType(zodToType("User", User));
+    const User = z.object({
+        public: z.object({
+            email: z.string(),
+        }),
+        private: z.object({
+            name: z.string(),
+            age: z.number(),
+        }),
+    });
+
+    const Profile = z.object({
+        public: z.null(),
+        private: z.object({
+            imageUrl: z.string(),
+        }),
+    });
+
+    const settings = new SafeSettings().withType(zodToType("User", User)).withType(zodToType("Profile", Profile));
+
+    const server = new SafeServer(settings);
+    // server.registerType(zodToType("User", User));
 
     // User.
 
     // let a: z.input<typeof Person>["name"]
 
-    const client = new SafeClient("ws://localhost:8080");
-    client.registerType(zodToType("User", User));
+    const client = new SafeClient("ws://localhost:8080", settings);
+    // client.create("Profile", {
+    //     private: {
+    //         imageUrl: "",
+    //     },
+    //     public: null,
+    // });
+    // client.registerType(zodToType("User", User));
 
     await client.authenticate("reddusted@gmail.com");
 
-    let id = await client.create("User", { name: "Stijn Rogiest", age: 25 }, { email: "reddusted@gmail.com" });
+    let id = await client.create("User", {
+        private: {
+            name: "Stijn Rogiest",
+            age: 25,
+        },
+        public: {
+            email: "reddusted@gmail.com",
+        },
+    });
 
     let obj = await client.get("User", id);
     // console.log("obj", obj);
 
-    await client.update("User", id, { name: obj!.private.name + "!!!!", age: obj!.private.age + 1 }, { email: "reddusted200@gmail.com" });
+    await client.update("User", id, {
+        private: { name: obj!.private.name + "!!!!", age: obj!.private.age + 1 },
+        public: { email: "reddusted200@gmail.com" },
+    });
 
     // obj = await client.get("User", id);
 
-    await client.update("User", id, { ...obj!.private, age: obj!.private.age + 1 });
+    await client.update("User", id, {
+        private: {
+            name: obj!.private.name + "!!!!",
+            age: obj!.private.age + 1,
+        },
+    });
 }
 
 main();
