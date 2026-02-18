@@ -24,22 +24,21 @@ datasource db {
 // }
 
 model User {
-  id          String @id @default(uuid())
-  userName    String @unique
-  selfGroup   Group  @relation(fields: [selfGroupId], references: [id], name: "SelfUserGroup")
-  selfGroupId String @unique
+  id          String               @id @default(uuid())
+  userName    String               @unique
+  selfGroup   GroupUserPermission? @relation(fields: [id, selfGroupId], references: [userId, groupId], name: "SelfGroupUserPermission")
+  selfGroupId String               @unique
   // admin       Boolean @default(false) // Admins are allowed to create new object types
 
-
   // authKey: Deviced from the master user password. authKey = pwhash(password, authSalt)
-  authSalt Bytes
+  authSalt      Bytes
   authHashedKey Bytes // Used to verify user. authHashedKey = crypto_generichash(authKey)
 
   // encryptionKey: Derived from the master user password. encryptionKey = pwhash(password, encryptionSalt)
   encryptionSalt Bytes
 
-  publicKey Bytes
-  encryptedPrivateKey Bytes // Encrypted with encryptionKey, which is derived from the master user password
+  publicKey                Bytes
+  encryptedPrivateKey      Bytes // Encrypted with encryptionKey, which is derived from the master user password
   encryptedPrivateKeyNonce Bytes
 
   groups GroupUserPermission[]
@@ -48,10 +47,15 @@ model User {
 }
 
 model GroupUserPermission {
-  userId  String
-  user    User   @relation(fields: [userId], references: [id])
-  groupId String
-  group   Group  @relation(fields: [groupId], references: [id])
+  userId      String
+  user        User    @relation(fields: [userId], references: [id])
+  groupId     String
+  group       Group   @relation(fields: [groupId], references: [id])
+  allowRead   Boolean @default(true)
+  allowWrite  Boolean @default(true)
+  allowCreate Boolean @default(true)
+
+  selfUser User? @relation(name: "SelfGroupUserPermission")
 
   encryptedGroupPrivateKey Bytes // Encrypted using User public key
   // encryptedGroupPrivateKeyNonce Bytes 
@@ -62,8 +66,6 @@ model GroupUserPermission {
 model Group {
   id String @id @default(uuid())
 
-  selfUser User? @relation(name: "SelfUserGroup")
-
   publicKey Bytes
   // privateKey: stored in GroupUserPermission
 
@@ -72,15 +74,13 @@ model Group {
 }
 
 model ObjectGroupPermission {
-  groupId    String
-  group      Group   @relation(fields: [groupId], references: [id])
-  objectId   BigInt
-  object     Object  @relation(fields: [objectId], references: [id])
-  allowRead  Boolean @default(true)
-  allowWrite Boolean @default(true)
+  groupId  String
+  group    Group  @relation(fields: [groupId], references: [id])
+  objectId BigInt
+  object   Object @relation(fields: [objectId], references: [id])
 
   encryptedObjectKey Bytes // Encrypted using Group public key
-  encryptedObjectKeyNonce Bytes 
+  // encryptedObjectKeyNonce Bytes
 
   @@id([groupId, objectId])
 }

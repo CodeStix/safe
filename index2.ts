@@ -49,6 +49,9 @@ type ServerMessage =
           dataBase64: string;
           nonceBase64: string;
           publicData: any;
+          groupId: string;
+          encryptedObjectKeyBase64: string;
+          //   encryptedObjectKeyNonceBase64: string;
       }
     | {
           type: "update";
@@ -67,6 +70,9 @@ type ServerMessage =
           type: "query";
           objectType: string;
           query: Record<string, any>;
+      }
+    | {
+          type: "get-user-groups";
       };
 
 // type ServerRequestMessage = ServerMessage & { request: number };
@@ -88,15 +94,15 @@ type ClientMessage =
     | {
           type: "login-response";
           request: number;
-          encryptionSaltBase64: string;
+
           publicKeyBase64: string;
           encryptedPrivateKeyNonceBase64: string;
           encryptedPrivateKeyBase64: string;
-          groups: {
-              publicKeyBase64: string;
-              encryptedGroupPrivateKeyBase64: string;
-              //   encryptedGroupPrivateKeyNonceBase64: string;
-          }[];
+          encryptionSaltBase64: string;
+
+          groupId: string;
+          groupPublicKeyBase64: string;
+          groupEncryptedPrivateKeyBase64: string;
       }
     | {
           type: "insert-response";
@@ -120,6 +126,9 @@ type ClientMessage =
           dataBase64?: string;
           nonceBase64?: string;
           publicData?: any;
+          groupId?: string;
+          encryptedObjectKeyBase64?: string;
+          //   encryptedObjectKeyNonceBase64?: string;
           //   version?: number;
       }
     | {
@@ -130,7 +139,28 @@ type ClientMessage =
     | {
           type: "query-response";
           request: number;
-          data: [id: number, dataBase64?: string, nonceBase64?: string, publicData?: any][];
+          data: [
+              id: number,
+              dataBase64: string,
+              nonceBase64: string,
+              publicData: any,
+              groupId: string,
+              encryptedObjectKeyBase64: string
+              //   encryptedObjectKeyNonceBase64: string
+          ][];
+      }
+    | {
+          type: "get-user-groups-response";
+          request: number;
+          selfGroupId: string;
+          groups: {
+              id: string;
+              publicKeyBase64: string;
+              encryptedGroupPrivateKeyBase64: string;
+              allowCreate: boolean;
+              allowRead: boolean;
+              allowWrite: boolean;
+          }[];
       };
 
 class AuthenticatedUser {
@@ -283,6 +313,12 @@ class SafeServer {
                 const hashedAuthKey = sodium.crypto_generichash(32, authKey, null) as Uint8Array<ArrayBuffer>;
 
                 await this.prisma.$transaction(async (prisma) => {
+                    const group = await prisma.group.create({
+                        data: {
+                            publicKey: groupPublicKey,
+                        },
+                    });
+
                     const user = await prisma.user.create({
                         data: {
                             userName: msg.userName,
@@ -294,30 +330,17 @@ class SafeServer {
                             encryptedPrivateKey: encryptedPrivateKey,
                             encryptedPrivateKeyNonce: encryptedPrivateKeyNonce,
                             encryptionSalt: encryptionSalt,
-
-                            selfGroup: {
-                                create: {
-                                    publicKey: groupPublicKey,
-                                },
-                            },
                         },
                     });
 
-                    await prisma.group.create({
+                    await prisma.groupUserPermission.create({
                         data: {
-                            publicKey: groupPublicKey,
-                            users: {
-                                create: {
-                                    encryptedGroupPrivateKey: groupEncryptedPrivateKey,
-                                    // encryptedGroupPrivateKeyNonce: groupEncryptedPrivateKeyNonce,
-                                    userId: user.id,
-                                },
-                            },
-                            selfUser: {
-                                connect: {
-                                    id: user.id,
-                                },
-                            },
+                            encryptedGroupPrivateKey: groupEncryptedPrivateKey,
+                            allowCreate: true,
+                            allowRead: true,
+                            allowWrite: true,
+                            groupId: group.id,
+                            userId: user.id,
                         },
                     });
                 });
@@ -357,7 +380,7 @@ class SafeServer {
                         encryptedPrivateKeyNonce: true,
                         encryptionSalt: true,
                         publicKey: true,
-                        groups: {
+                        selfGroup: {
                             select: {
                                 encryptedGroupPrivateKey: true,
                                 // encryptedGroupPrivateKeyNonce: true,
@@ -369,6 +392,18 @@ class SafeServer {
                                 },
                             },
                         },
+                        // groups: {
+                        //     select: {
+                        //         encryptedGroupPrivateKey: true,
+                        //         // encryptedGroupPrivateKeyNonce: true,
+                        //         group: {
+                        //             select: {
+                        //                 id: true,
+                        //                 publicKey: true,
+                        //             },
+                        //         },
+                        //     },
+                        // },
                     },
                 });
 
@@ -387,17 +422,69 @@ class SafeServer {
                 wsUser.send({
                     type: "login-response",
                     request: msg.request,
+
+                    publicKeyBase64: encodeBase64(user.publicKey),
                     encryptedPrivateKeyBase64: encodeBase64(user.encryptedPrivateKey),
                     encryptedPrivateKeyNonceBase64: encodeBase64(user.encryptedPrivateKeyNonce),
                     encryptionSaltBase64: encodeBase64(user.encryptionSalt),
-                    publicKeyBase64: encodeBase64(user.publicKey),
-                    groups: user.groups.map((e) => ({
-                        publicKeyBase64: encodeBase64(e.group.publicKey),
-                        encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
-                        // encryptedGroupPrivateKeyNonceBase64: encodeBase64(e.encryptedGroupPrivateKeyNonce),
-                    })),
+
+                    groupId: user.selfGroup!.group.id,
+                    groupPublicKeyBase64: encodeBase64(user.selfGroup!.group.publicKey),
+                    groupEncryptedPrivateKeyBase64: encodeBase64(user.selfGroup!.encryptedGroupPrivateKey),
+
+                    // groups: user.groups.map((e) => ({
+                    //     id: e.group.id,
+                    //     publicKeyBase64: encodeBase64(e.group.publicKey),
+                    //     encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
+                    //     // encryptedGroupPrivateKeyNonceBase64: encodeBase64(e.encryptedGroupPrivateKeyNonce),
+                    // })),
                 });
 
+                break;
+            }
+
+            case "get-user-groups": {
+                if (!user) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
+                    break;
+                }
+
+                const userObj = await this.prisma.user.findUniqueOrThrow({
+                    where: {
+                        id: user.id,
+                    },
+                    select: {
+                        selfGroupId: true,
+                        groups: {
+                            select: {
+                                encryptedGroupPrivateKey: true,
+                                allowCreate: true,
+                                allowRead: true,
+                                allowWrite: true,
+                                group: {
+                                    select: {
+                                        id: true,
+                                        publicKey: true,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                });
+
+                wsUser.send({
+                    type: "get-user-groups-response",
+                    request: msg.request,
+                    selfGroupId: userObj.selfGroupId,
+                    groups: userObj.groups.map((e) => ({
+                        id: e.group.id,
+                        publicKeyBase64: encodeBase64(e.group.publicKey),
+                        encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
+                        allowCreate: e.allowCreate,
+                        allowRead: e.allowRead,
+                        allowWrite: e.allowWrite,
+                    })),
+                });
                 break;
             }
 
@@ -433,6 +520,9 @@ class SafeServer {
                     }
                 }
 
+                const encryptedObjectKey = Buffer.from(msg.encryptedObjectKeyBase64, "base64");
+                // const encryptedObjectKeyNonce = Buffer.from(msg.encryptedObjectKeyNonceBase64, "base64");
+
                 const obj = await this.prisma.object.create({
                     data: {
                         type: objectType.name,
@@ -441,11 +531,24 @@ class SafeServer {
                         publicData: publicData,
                         groups: {
                             create: {
-                                groupId: user.selfGroupId,
-                                encryptedObjectKey: new Uint8Array(), // TODO
-                                encryptedObjectKeyNonce: new Uint8Array(), // TODO
+                                encryptedObjectKey: encryptedObjectKey,
+                                // encryptedObjectKeyNonce: encryptedObjectKeyNonce,
+                                group: {
+                                    connect: {
+                                        id: msg.groupId,
+                                        users: {
+                                            some: {
+                                                userId: user.id,
+                                                allowCreate: true,
+                                            },
+                                        },
+                                    },
+                                },
                             },
                         },
+                    },
+                    select: {
+                        id: true,
                     },
                 });
 
@@ -476,16 +579,22 @@ class SafeServer {
                             type: objectType.name,
                             groups: {
                                 some: {
-                                    allowWrite: true,
                                     group: {
                                         users: {
                                             some: {
                                                 userId: user.id,
+                                                allowWrite: true,
                                             },
                                         },
                                     },
                                 },
                             },
+                        },
+                        select: {
+                            id: true,
+                            data: true,
+                            nonce: true,
+                            publicData: true,
                         },
                     });
 
@@ -533,6 +642,7 @@ class SafeServer {
                             nonce: nonce,
                             publicData: publicData,
                         },
+                        select: {},
                     });
 
                     wsUser.send({
@@ -568,10 +678,10 @@ class SafeServer {
                         type: objectType.name,
                         groups: {
                             some: {
-                                allowRead: true,
                                 group: {
                                     users: {
                                         some: {
+                                            allowRead: true,
                                             userId: user.id,
                                         },
                                     },
@@ -585,17 +695,47 @@ class SafeServer {
                         data: true,
                         nonce: true,
                         publicData: true,
+                        groups: {
+                            take: 1,
+                            where: {
+                                group: {
+                                    users: {
+                                        some: {
+                                            allowRead: true,
+                                            userId: user.id,
+                                        },
+                                    },
+                                },
+                            },
+                            select: {
+                                groupId: true,
+                                encryptedObjectKey: true,
+                                // encryptedObjectKeyNonce: true,
+                            },
+                        },
                     },
                 });
 
-                const convertedData: [id: number, dataBase64?: string, nonceBase64?: string, publicData?: any][] = [];
+                const convertedData: [
+                    id: number,
+                    dataBase64: string,
+                    nonceBase64: string,
+                    publicData: any,
+                    groupId: string,
+                    encryptedObjectKeyBase64: string
+                    // encryptedObjectKeyNonceBase64: string
+                ][] = [];
 
                 for (const row of obj) {
+                    const group = row.groups[0]!;
                     convertedData.push([
                         Number(row.id),
                         Buffer.from(row.data).toString("base64"),
                         Buffer.from(row.nonce).toString("base64"),
                         row.publicData,
+                        group.groupId,
+                        Buffer.from(group.encryptedObjectKey).toString("base64"),
+                        // Buffer.from(group.encryptedObjectKeyNonce).toString("base64"),
                     ]);
                 }
 
@@ -626,10 +766,10 @@ class SafeServer {
                         type: objectType.name,
                         groups: {
                             some: {
-                                allowRead: true,
                                 group: {
                                     users: {
                                         some: {
+                                            allowRead: true,
                                             userId: user.id,
                                         },
                                     },
@@ -637,15 +777,42 @@ class SafeServer {
                             },
                         },
                     },
+                    select: {
+                        data: true,
+                        nonce: true,
+                        publicData: true,
+                        groups: {
+                            take: 1,
+                            where: {
+                                group: {
+                                    users: {
+                                        some: {
+                                            allowRead: true,
+                                            userId: user.id,
+                                        },
+                                    },
+                                },
+                            },
+                            select: {
+                                groupId: true,
+                                encryptedObjectKey: true,
+                                // encryptedObjectKeyNonce: true,
+                            },
+                        },
+                    },
                 });
 
                 if (obj) {
+                    const group = obj.groups[0]!;
                     wsUser.send({
                         type: "get-response",
                         request: msg.request,
                         dataBase64: Buffer.from(obj.data).toString("base64"),
                         nonceBase64: Buffer.from(obj.nonce).toString("base64"),
-                        publicData: obj.publicData as object,
+                        publicData: obj.publicData,
+                        groupId: group.groupId,
+                        encryptedObjectKeyBase64: Buffer.from(group.encryptedObjectKey).toString("base64"),
+                        // encryptedObjectKeyNonceBase64: Buffer.from(group.encryptedObjectKeyNonce).toString("base64"),
                     });
                 } else {
                     wsUser.send({
@@ -796,6 +963,12 @@ class SafeClient<T extends Record<string, ObjectType>> {
     keyPerId = new Map<number, StoredKey>();
     objectTypes = new Map<string, ObjectType>();
 
+    private userPublicKey?: Uint8Array;
+    private userPrivateKey?: Uint8Array;
+    private groupPublicKey?: Uint8Array;
+    private groupPrivateKey?: Uint8Array;
+    private userGroupId?: string;
+
     static currentRequestId: number = 1;
 
     constructor(url: string, settings: SafeSettings<T>) {
@@ -919,15 +1092,31 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
         console.log("keypair", { publicKey, privateKey });
 
-        for (const group of loginResponse.groups) {
-            const groupPublicKey = decodeBase64(group.publicKeyBase64);
-            const groupPrivateKey = sodium.crypto_box_seal_open(decodeBase64(group.encryptedGroupPrivateKeyBase64), publicKey, privateKey);
+        const groupPublicKey = decodeBase64(loginResponse.groupPublicKeyBase64);
+        const groupPrivateKey = sodium.crypto_box_seal_open(decodeBase64(loginResponse.groupEncryptedPrivateKeyBase64), publicKey, privateKey);
 
-            console.log("group", {
-                groupPublicKey,
-                groupPrivateKey,
-            });
-        }
+        console.log("group keypair", {
+            id: loginResponse.groupId,
+            groupPublicKey,
+            groupPrivateKey,
+        });
+
+        this.userPublicKey = publicKey;
+        this.userPrivateKey = privateKey;
+        this.groupPublicKey = groupPublicKey;
+        this.groupPrivateKey = groupPrivateKey;
+        this.userGroupId = loginResponse.groupId;
+
+        // for (const group of loginResponse.groups) {
+        //     const groupPublicKey = decodeBase64(group.publicKeyBase64);
+        //     const groupPrivateKey = sodium.crypto_box_seal_open(decodeBase64(group.encryptedGroupPrivateKeyBase64), publicKey, privateKey);
+
+        //     console.log("group", {
+        //         id: group.id,
+        //         groupPublicKey,
+        //         groupPrivateKey,
+        //     });
+        // }
 
         console.timeEnd("login");
     }
@@ -951,6 +1140,10 @@ class SafeClient<T extends Record<string, ObjectType>> {
     async createRaw(typeName: string, privateData: Uint8Array, publicData: any | undefined): Promise<number> {
         await sodium.ready;
 
+        if (!this.userGroupId || !this.groupPublicKey) {
+            throw new Error("No key available");
+        }
+
         const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
         const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
 
@@ -960,12 +1153,18 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
         console.log("Create key size", key.length, "nonce size", nonce.length, "nonce", nonceToInt(nonce));
 
+        const encryptedObjectKey = sodium.crypto_box_seal(key, this.groupPublicKey);
+
         const res = await this.request({
             type: "insert",
             objectType: typeName,
             dataBase64: encodeBase64(cipher),
             nonceBase64: encodeBase64(nonce),
             publicData: publicData,
+            encryptedObjectKeyBase64: encodeBase64(encryptedObjectKey),
+            // encryptedObjectKeyNonceBase64: encodeBase64(null),
+            groupId: this.userGroupId, // TODO
+
             // version: 1,
         });
         if (res.type !== "insert-response") {
