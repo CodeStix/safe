@@ -29,6 +29,10 @@ type ServerMessage =
           publicKeyBase64: string;
           encryptedPrivateKeyBase64: string;
           encryptedPrivateKeyNonceBase64: string;
+
+          groupPublicKeyBase64: string;
+          groupEncryptedPrivateKeyBase64: string;
+          //   groupEncryptedPrivateKeyNonceBase64: string;
       }
     | {
           type: "get-user";
@@ -88,6 +92,11 @@ type ClientMessage =
           publicKeyBase64: string;
           encryptedPrivateKeyNonceBase64: string;
           encryptedPrivateKeyBase64: string;
+          groups: {
+              publicKeyBase64: string;
+              encryptedGroupPrivateKeyBase64: string;
+              //   encryptedGroupPrivateKeyNonceBase64: string;
+          }[];
       }
     | {
           type: "insert-response";
@@ -261,31 +270,56 @@ class SafeServer {
             case "register": {
                 const authKey = decodeBase64(msg.authKeyBase64);
                 const authSalt = decodeBase64(msg.authSaltBase64);
-                const encryptionSalt = decodeBase64(msg.encryptionSaltBase64);
+
                 const publicKey = decodeBase64(msg.publicKeyBase64);
                 const encryptedPrivateKey = decodeBase64(msg.encryptedPrivateKeyBase64);
                 const encryptedPrivateKeyNonce = decodeBase64(msg.encryptedPrivateKeyNonceBase64);
+                const encryptionSalt = decodeBase64(msg.encryptionSaltBase64);
+
+                const groupPublicKey = decodeBase64(msg.groupPublicKeyBase64);
+                const groupEncryptedPrivateKey = decodeBase64(msg.groupEncryptedPrivateKeyBase64);
+                // const groupEncryptedPrivateKeyNonce = decodeBase64(msg.groupEncryptedPrivateKeyNonceBase64);
 
                 const hashedAuthKey = sodium.crypto_generichash(32, authKey, null) as Uint8Array<ArrayBuffer>;
 
-                await this.prisma.user.create({
-                    data: {
-                        userName: msg.userName,
+                await this.prisma.$transaction(async (prisma) => {
+                    const user = await prisma.user.create({
+                        data: {
+                            userName: msg.userName,
 
-                        authHashedKey: hashedAuthKey,
-                        authSalt: authSalt,
+                            authHashedKey: hashedAuthKey,
+                            authSalt: authSalt,
 
-                        publicKey: publicKey,
-                        encryptedPrivateKey: encryptedPrivateKey,
-                        encryptedPrivateKeyNonce: encryptedPrivateKeyNonce,
-                        encryptionSalt: encryptionSalt,
+                            publicKey: publicKey,
+                            encryptedPrivateKey: encryptedPrivateKey,
+                            encryptedPrivateKeyNonce: encryptedPrivateKeyNonce,
+                            encryptionSalt: encryptionSalt,
 
-                        selfGroup: {
-                            create: {
-                                publicKey: new Uint8Array(), // TODO
+                            selfGroup: {
+                                create: {
+                                    publicKey: groupPublicKey,
+                                },
                             },
                         },
-                    },
+                    });
+
+                    await prisma.group.create({
+                        data: {
+                            publicKey: groupPublicKey,
+                            users: {
+                                create: {
+                                    encryptedGroupPrivateKey: groupEncryptedPrivateKey,
+                                    // encryptedGroupPrivateKeyNonce: groupEncryptedPrivateKeyNonce,
+                                    userId: user.id,
+                                },
+                            },
+                            selfUser: {
+                                connect: {
+                                    id: user.id,
+                                },
+                            },
+                        },
+                    });
                 });
 
                 wsUser.send({ type: "register-response", request: msg.request });
@@ -316,6 +350,26 @@ class SafeServer {
                     where: {
                         userName: msg.userName,
                     },
+                    select: {
+                        authHashedKey: true,
+                        // authSalt: true,
+                        encryptedPrivateKey: true,
+                        encryptedPrivateKeyNonce: true,
+                        encryptionSalt: true,
+                        publicKey: true,
+                        groups: {
+                            select: {
+                                encryptedGroupPrivateKey: true,
+                                // encryptedGroupPrivateKeyNonce: true,
+                                group: {
+                                    select: {
+                                        id: true,
+                                        publicKey: true,
+                                    },
+                                },
+                            },
+                        },
+                    },
                 });
 
                 if (!user) {
@@ -328,6 +382,8 @@ class SafeServer {
                     break;
                 }
 
+                delete (user as any).authHashedKey;
+
                 wsUser.send({
                     type: "login-response",
                     request: msg.request,
@@ -335,6 +391,11 @@ class SafeServer {
                     encryptedPrivateKeyNonceBase64: encodeBase64(user.encryptedPrivateKeyNonce),
                     encryptionSaltBase64: encodeBase64(user.encryptionSalt),
                     publicKeyBase64: encodeBase64(user.publicKey),
+                    groups: user.groups.map((e) => ({
+                        publicKeyBase64: encodeBase64(e.group.publicKey),
+                        encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
+                        // encryptedGroupPrivateKeyNonceBase64: encodeBase64(e.encryptedGroupPrivateKeyNonce),
+                    })),
                 });
 
                 break;
@@ -382,6 +443,7 @@ class SafeServer {
                             create: {
                                 groupId: user.selfGroupId,
                                 encryptedObjectKey: new Uint8Array(), // TODO
+                                encryptedObjectKeyNonce: new Uint8Array(), // TODO
                             },
                         },
                     },
@@ -787,19 +849,23 @@ class SafeClient<T extends Record<string, ObjectType>> {
         const authKey = this.deriveKey(password, authSalt);
         const encryptionKey = this.deriveKey(password, encryptionSalt);
 
-        const identityKeypair = sodium.crypto_box_keypair();
-
+        const userKeypair = sodium.crypto_box_keypair();
         const encryptedPrivateKeyNonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
         const encryptedPrivateKey = sodium.crypto_aead_chacha20poly1305_encrypt(
-            identityKeypair.privateKey,
+            userKeypair.privateKey,
             null,
             null,
             encryptedPrivateKeyNonce,
             encryptionKey
         );
 
+        const groupKeypair = sodium.crypto_box_keypair();
+        // const encryptedGroupPrivateKeyNonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+        const encryptedGroupPrivateKey = sodium.crypto_box_seal(groupKeypair.privateKey, userKeypair.publicKey);
+
         console.timeEnd("register");
-        console.log("keypair", identityKeypair);
+        console.log("user keypair", userKeypair);
+        console.log("group keypair", groupKeypair);
 
         const res = await this.request({
             type: "register",
@@ -809,7 +875,10 @@ class SafeClient<T extends Record<string, ObjectType>> {
             encryptedPrivateKeyBase64: encodeBase64(encryptedPrivateKey),
             encryptedPrivateKeyNonceBase64: encodeBase64(encryptedPrivateKeyNonce),
             encryptionSaltBase64: encodeBase64(encryptionSalt),
-            publicKeyBase64: encodeBase64(identityKeypair.publicKey),
+            publicKeyBase64: encodeBase64(userKeypair.publicKey),
+            groupPublicKeyBase64: encodeBase64(groupKeypair.publicKey),
+            groupEncryptedPrivateKeyBase64: encodeBase64(encryptedGroupPrivateKey),
+            // groupEncryptedPrivateKeyNonceBase64: encodeBase64(encryptedGroupPrivateKeyNonce),
         });
         if (res.type !== "register-response") throw new Error();
     }
@@ -848,8 +917,19 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
         const privateKey = sodium.crypto_aead_chacha20poly1305_decrypt(null, encryptedPrivateKey, null, encryptedPrivateKeyNonce, encryptionKey);
 
-        console.timeEnd("login");
         console.log("keypair", { publicKey, privateKey });
+
+        for (const group of loginResponse.groups) {
+            const groupPublicKey = decodeBase64(group.publicKeyBase64);
+            const groupPrivateKey = sodium.crypto_box_seal_open(decodeBase64(group.encryptedGroupPrivateKeyBase64), publicKey, privateKey);
+
+            console.log("group", {
+                groupPublicKey,
+                groupPrivateKey,
+            });
+        }
+
+        console.timeEnd("login");
     }
 
     async request(msg: ServerMessage) {
@@ -1175,7 +1255,7 @@ async function main() {
     const client = new SafeClient("ws://localhost:8080", settings);
 
     // await client.login("stijn", "Vrijdag1@");
-    await client.login("stijn", "Vrijdag1@");
+    await client.login("stijn2", "Vrijdag1@");
 
     return;
 

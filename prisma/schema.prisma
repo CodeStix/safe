@@ -54,6 +54,7 @@ model GroupUserPermission {
   group   Group  @relation(fields: [groupId], references: [id])
 
   encryptedGroupPrivateKey Bytes // Encrypted using User public key
+  // encryptedGroupPrivateKeyNonce Bytes 
 
   @@id([userId, groupId])
 }
@@ -79,6 +80,7 @@ model ObjectGroupPermission {
   allowWrite Boolean @default(true)
 
   encryptedObjectKey Bytes // Encrypted using Group public key
+  encryptedObjectKeyNonce Bytes 
 
   @@id([groupId, objectId])
 }
