@@ -1529,7 +1529,7 @@ async function main() {
     await client.update("User", 1, {
         private: {
             age: 24,
-            name: "stijn rogiest (sr)",
+            name: "sr",
         },
         public: {
             email: "stijnvantvijfde@gmail.com",
