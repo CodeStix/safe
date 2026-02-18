@@ -1,5 +1,5 @@
 import "dotenv/config";
-import sodium from "libsodium-wrappers";
+import sodium from "libsodium-wrappers-sumo";
 import { WebSocket, WebSocketServer, RawData } from "ws";
 import { IncomingMessage } from "http";
 import { PrismaClient } from "./prisma/prisma/client";
@@ -12,9 +12,32 @@ import * as z from "zod";
 // type ObjectTypeName = string;
 
 type ServerMessage =
+    // | {
+    //       type: "auth";
+    //       email: string;
+    //   }
     | {
-          type: "auth";
-          email: string;
+          type: "register";
+          userName: string;
+
+          authSaltBase64: string;
+          authKeyBase64: string;
+
+          encryptionSaltBase64: string;
+          // Do not send encryptionKey!
+
+          publicKeyBase64: string;
+          encryptedPrivateKeyBase64: string;
+          encryptedPrivateKeyNonceBase64: string;
+      }
+    | {
+          type: "get-user";
+          userName: string;
+      }
+    | {
+          type: "login";
+          userName: string;
+          authKeyBase64: string;
       }
     | {
           type: "insert";
@@ -45,9 +68,26 @@ type ServerMessage =
 // type ServerRequestMessage = ServerMessage & { request: number };
 
 type ClientMessage =
+    // | {
+    //       type: "auth-response";
+    //       request: number;
+    //   }
     | {
-          type: "auth-response";
+          type: "register-response";
           request: number;
+      }
+    | {
+          type: "get-user-response";
+          request: number;
+          authSaltBase64?: string;
+      }
+    | {
+          type: "login-response";
+          request: number;
+          encryptionSaltBase64: string;
+          publicKeyBase64: string;
+          encryptedPrivateKeyNonceBase64: string;
+          encryptedPrivateKeyBase64: string;
       }
     | {
           type: "insert-response";
@@ -170,37 +210,133 @@ class SafeServer {
         this.handleMessage(ws, msg);
     }
 
+    // async getUserSaltOrRandomSalt(userName: string) {
+    //     const user = await this.prisma.user.findUnique({
+    //         where: {
+    //             userName: userName,
+    //         },
+    //     });
+
+    //     if (!user) {
+    //         return sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
+    //     } else {
+    //         return user.authSalt;
+    //     }
+    // }
+
     async handleMessage(ws: WebSocket, msg: ServerMessage & { request: number }) {
         const wsUser = this.userPerSocket.get(ws) ?? new AuthenticatedUser(ws, undefined);
         const user = await wsUser.getUser(this.prisma);
 
         switch (msg.type) {
-            case "auth": {
-                const user = await this.prisma.user.upsert({
-                    where: { email: msg.email },
-                    create: {
-                        email: msg.email,
+            // case "auth": {
+            //     const user = await this.prisma.user.upsert({
+            //         where: { email: msg.email },
+            //         create: {
+            //             email: msg.email,
+            //             selfGroup: {
+            //                 create: {},
+            //             },
+            //         },
+            //         update: {},
+            //     });
+            //     await this.prisma.groupUserPermission.upsert({
+            //         where: {
+            //             userId_groupId: {
+            //                 userId: user.id,
+            //                 groupId: user.selfGroupId,
+            //             },
+            //         },
+            //         create: {
+            //             userId: user.id,
+            //             groupId: user.selfGroupId,
+            //         },
+            //         update: {},
+            //     });
+            //     this.userPerSocket.set(ws, new AuthenticatedUser(ws, user.id));
+            //     wsUser.send({ type: "auth-response", request: msg.request });
+            //     break;
+            // }
+
+            case "register": {
+                const authKey = decodeBase64(msg.authKeyBase64);
+                const authSalt = decodeBase64(msg.authSaltBase64);
+                const encryptionSalt = decodeBase64(msg.encryptionSaltBase64);
+                const publicKey = decodeBase64(msg.publicKeyBase64);
+                const encryptedPrivateKey = decodeBase64(msg.encryptedPrivateKeyBase64);
+                const encryptedPrivateKeyNonce = decodeBase64(msg.encryptedPrivateKeyNonceBase64);
+
+                const hashedAuthKey = sodium.crypto_generichash(32, authKey, null) as Uint8Array<ArrayBuffer>;
+
+                await this.prisma.user.create({
+                    data: {
+                        userName: msg.userName,
+
+                        authHashedKey: hashedAuthKey,
+                        authSalt: authSalt,
+
+                        publicKey: publicKey,
+                        encryptedPrivateKey: encryptedPrivateKey,
+                        encryptedPrivateKeyNonce: encryptedPrivateKeyNonce,
+                        encryptionSalt: encryptionSalt,
+
                         selfGroup: {
-                            create: {},
+                            create: {
+                                publicKey: new Uint8Array(), // TODO
+                            },
                         },
                     },
-                    update: {},
                 });
-                await this.prisma.groupUserPermission.upsert({
+
+                wsUser.send({ type: "register-response", request: msg.request });
+
+                break;
+            }
+
+            case "get-user": {
+                const user = await this.prisma.user.findUnique({
                     where: {
-                        userId_groupId: {
-                            userId: user.id,
-                            groupId: user.selfGroupId,
-                        },
+                        userName: msg.userName,
                     },
-                    create: {
-                        userId: user.id,
-                        groupId: user.selfGroupId,
-                    },
-                    update: {},
                 });
-                this.userPerSocket.set(ws, new AuthenticatedUser(ws, user.id));
-                wsUser.send({ type: "auth-response", request: msg.request });
+
+                wsUser.send({
+                    type: "get-user-response",
+                    request: msg.request,
+                    authSaltBase64: user ? encodeBase64(user.authSalt) : undefined,
+                });
+                break;
+            }
+
+            case "login": {
+                const authKey = decodeBase64(msg.authKeyBase64);
+                const hashedAuthKey = sodium.crypto_generichash(32, authKey, null);
+
+                const user = await this.prisma.user.findUnique({
+                    where: {
+                        userName: msg.userName,
+                    },
+                });
+
+                if (!user) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unknown user" });
+                    break;
+                }
+
+                if (sodium.compare(user.authHashedKey, hashedAuthKey) !== 0) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Invalid password" });
+                    break;
+                }
+
+                wsUser.send({
+                    type: "login-response",
+                    request: msg.request,
+                    encryptedPrivateKeyBase64: encodeBase64(user.encryptedPrivateKey),
+                    encryptedPrivateKeyNonceBase64: encodeBase64(user.encryptedPrivateKeyNonce),
+                    encryptionSaltBase64: encodeBase64(user.encryptionSalt),
+                    publicKeyBase64: encodeBase64(user.publicKey),
+                });
+
                 break;
             }
 
@@ -245,6 +381,7 @@ class SafeServer {
                         groups: {
                             create: {
                                 groupId: user.selfGroupId,
+                                encryptedObjectKey: new Uint8Array(), // TODO
                             },
                         },
                     },
@@ -505,13 +642,26 @@ function encodeBase64(bytes: Uint8Array): string {
     return btoa(binary);
 }
 
-function decodeBase64(base64: string): Uint8Array {
+function decodeBase64(base64: string): Uint8Array<ArrayBuffer> {
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
     }
     return bytes;
+}
+
+function compareBufferSameTime(a: Uint8Array, b: Uint8Array) {
+    if (a.length !== b.length) return false;
+
+    let same = true;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) {
+            same = false;
+        }
+    }
+
+    return same;
 }
 
 // function incrementNonce(nonce: Uint8Array): Uint8Array {
@@ -615,8 +765,91 @@ class SafeClient<T extends Record<string, ObjectType>> {
         }
     }
 
-    async authenticate(email: string) {
-        await this.request({ type: "auth", email: email });
+    deriveKey(password: Uint8Array | string, salt: Uint8Array) {
+        return sodium.crypto_pwhash(
+            32,
+            password,
+            salt,
+            sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE,
+            sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE,
+            sodium.crypto_pwhash_ALG_ARGON2ID13
+        );
+    }
+
+    async register(userName: string, password: string) {
+        await sodium.ready;
+
+        console.time("register");
+
+        const authSalt = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
+        const encryptionSalt = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
+
+        const authKey = this.deriveKey(password, authSalt);
+        const encryptionKey = this.deriveKey(password, encryptionSalt);
+
+        const identityKeypair = sodium.crypto_box_keypair();
+
+        const encryptedPrivateKeyNonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+        const encryptedPrivateKey = sodium.crypto_aead_chacha20poly1305_encrypt(
+            identityKeypair.privateKey,
+            null,
+            null,
+            encryptedPrivateKeyNonce,
+            encryptionKey
+        );
+
+        console.timeEnd("register");
+        console.log("keypair", identityKeypair);
+
+        const res = await this.request({
+            type: "register",
+            userName: userName,
+            authKeyBase64: encodeBase64(authKey),
+            authSaltBase64: encodeBase64(authSalt),
+            encryptedPrivateKeyBase64: encodeBase64(encryptedPrivateKey),
+            encryptedPrivateKeyNonceBase64: encodeBase64(encryptedPrivateKeyNonce),
+            encryptionSaltBase64: encodeBase64(encryptionSalt),
+            publicKeyBase64: encodeBase64(identityKeypair.publicKey),
+        });
+        if (res.type !== "register-response") throw new Error();
+    }
+
+    async login(userName: string, password: string) {
+        await sodium.ready;
+
+        const getUserResponse = await this.request({
+            type: "get-user",
+            userName: userName,
+        });
+        if (getUserResponse.type !== "get-user-response") throw new Error();
+
+        if (typeof getUserResponse.authSaltBase64 !== "string") {
+            throw new Error("User not found");
+        }
+
+        const authSalt = decodeBase64(getUserResponse.authSaltBase64);
+        const authKey = this.deriveKey(password, authSalt);
+
+        const loginResponse = await this.request({
+            type: "login",
+            userName: userName,
+            authKeyBase64: encodeBase64(authKey),
+        });
+        if (loginResponse.type !== "login-response") throw new Error();
+
+        console.time("login");
+
+        const encryptionSalt = decodeBase64(loginResponse.encryptionSaltBase64);
+        const publicKey = decodeBase64(loginResponse.publicKeyBase64);
+        const encryptedPrivateKeyNonce = decodeBase64(loginResponse.encryptedPrivateKeyNonceBase64);
+        const encryptedPrivateKey = decodeBase64(loginResponse.encryptedPrivateKeyBase64);
+
+        const encryptionKey = this.deriveKey(password, encryptionSalt);
+
+        const privateKey = sodium.crypto_aead_chacha20poly1305_decrypt(null, encryptedPrivateKey, null, encryptedPrivateKeyNonce, encryptionKey);
+
+        console.timeEnd("login");
+        console.log("keypair", { publicKey, privateKey });
     }
 
     async request(msg: ServerMessage) {
@@ -823,7 +1056,7 @@ class SafeClient<T extends Record<string, ObjectType>> {
         return { private: privateData, public: publicData } as GetSafeData<T[K]>;
     }
 
-    async query<K extends keyof T & string>(type: K, query: SafeDataQuery<T[K]>): Promise<GetSafeData<T[K]>[]> {}
+    // async query<K extends keyof T & string>(type: K, query: SafeDataQuery<T[K]>): Promise<GetSafeData<T[K]>[]> {}
 
     async create<K extends keyof T & string>(type: K, data: GetSafeData<T[K]>) {
         const objectType = this.getType(type);
@@ -940,6 +1173,12 @@ async function main() {
     // let a: z.input<typeof Person>["name"]
 
     const client = new SafeClient("ws://localhost:8080", settings);
+
+    // await client.login("stijn", "Vrijdag1@");
+    await client.login("stijn", "Vrijdag1@");
+
+    return;
+
     // client.create("Profile", {
     //     private: {
     //         imageUrl: "",
@@ -948,13 +1187,14 @@ async function main() {
     // });
     // client.registerType(zodToType("User", User));
 
-    await client.authenticate("reddusted@gmail.com");
+    // await client.authenticate("reddusted@gmail.com");
+    // await client.register()
 
-    const users = await client.query("User", {
-        public: {
-            email: 123,
-        },
-    });
+    // const users = await client.query("User", {
+    //     public: {
+    //         email: "",
+    //     },
+    // });
 
     let id = await client.create("User", {
         private: {
