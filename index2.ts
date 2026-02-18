@@ -100,9 +100,18 @@ type ClientMessage =
           encryptedPrivateKeyBase64: string;
           encryptionSaltBase64: string;
 
-          groupId: string;
-          groupPublicKeyBase64: string;
-          groupEncryptedPrivateKeyBase64: string;
+          //   groupId: string;
+          //   groupPublicKeyBase64: string;
+          //   groupEncryptedPrivateKeyBase64: string;
+          selfGroupId: string;
+          groups: {
+              id: string;
+              publicKeyBase64: string;
+              encryptedGroupPrivateKeyBase64: string;
+              allowCreate: boolean;
+              allowRead: boolean;
+              allowWrite: boolean;
+          }[];
       }
     | {
           type: "insert-response";
@@ -312,7 +321,7 @@ class SafeServer {
 
                 const hashedAuthKey = sodium.crypto_generichash(32, authKey, null) as Uint8Array<ArrayBuffer>;
 
-                await this.prisma.$transaction(async (prisma) => {
+                const user = await this.prisma.$transaction(async (prisma) => {
                     const group = await prisma.group.create({
                         data: {
                             publicKey: groupPublicKey,
@@ -330,6 +339,11 @@ class SafeServer {
                             encryptedPrivateKey: encryptedPrivateKey,
                             encryptedPrivateKeyNonce: encryptedPrivateKeyNonce,
                             encryptionSalt: encryptionSalt,
+
+                            selfGroupId: group.id,
+                        },
+                        select: {
+                            id: true,
                         },
                     });
 
@@ -343,7 +357,11 @@ class SafeServer {
                             userId: user.id,
                         },
                     });
+
+                    return user;
                 });
+
+                this.userPerSocket.set(ws, new AuthenticatedUser(ws, user.id));
 
                 wsUser.send({ type: "register-response", request: msg.request });
 
@@ -374,25 +392,14 @@ class SafeServer {
                         userName: msg.userName,
                     },
                     select: {
+                        id: true,
                         authHashedKey: true,
                         // authSalt: true,
                         encryptedPrivateKey: true,
                         encryptedPrivateKeyNonce: true,
                         encryptionSalt: true,
                         publicKey: true,
-                        selfGroup: {
-                            select: {
-                                encryptedGroupPrivateKey: true,
-                                // encryptedGroupPrivateKeyNonce: true,
-                                group: {
-                                    select: {
-                                        id: true,
-                                        publicKey: true,
-                                    },
-                                },
-                            },
-                        },
-                        // groups: {
+                        // selfGroup: {
                         //     select: {
                         //         encryptedGroupPrivateKey: true,
                         //         // encryptedGroupPrivateKeyNonce: true,
@@ -404,6 +411,21 @@ class SafeServer {
                         //         },
                         //     },
                         // },
+                        selfGroupId: true,
+                        groups: {
+                            select: {
+                                encryptedGroupPrivateKey: true,
+                                allowCreate: true,
+                                allowRead: true,
+                                allowWrite: true,
+                                group: {
+                                    select: {
+                                        id: true,
+                                        publicKey: true,
+                                    },
+                                },
+                            },
+                        },
                     },
                 });
 
@@ -419,6 +441,8 @@ class SafeServer {
 
                 delete (user as any).authHashedKey;
 
+                this.userPerSocket.set(ws, new AuthenticatedUser(ws, user.id));
+
                 wsUser.send({
                     type: "login-response",
                     request: msg.request,
@@ -428,18 +452,19 @@ class SafeServer {
                     encryptedPrivateKeyNonceBase64: encodeBase64(user.encryptedPrivateKeyNonce),
                     encryptionSaltBase64: encodeBase64(user.encryptionSalt),
 
-                    groupId: user.selfGroup!.group.id,
-                    groupPublicKeyBase64: encodeBase64(user.selfGroup!.group.publicKey),
-                    groupEncryptedPrivateKeyBase64: encodeBase64(user.selfGroup!.encryptedGroupPrivateKey),
-
-                    // groups: user.groups.map((e) => ({
-                    //     id: e.group.id,
-                    //     publicKeyBase64: encodeBase64(e.group.publicKey),
-                    //     encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
-                    //     // encryptedGroupPrivateKeyNonceBase64: encodeBase64(e.encryptedGroupPrivateKeyNonce),
-                    // })),
+                    // groupId: user.selfGroup!.group.id,
+                    // groupPublicKeyBase64: encodeBase64(user.selfGroup!.group.publicKey),
+                    // groupEncryptedPrivateKeyBase64: encodeBase64(user.selfGroup!.encryptedGroupPrivateKey),
+                    selfGroupId: user.selfGroupId,
+                    groups: user.groups.map((e) => ({
+                        id: e.group.id,
+                        publicKeyBase64: encodeBase64(e.group.publicKey),
+                        encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
+                        allowCreate: e.allowCreate,
+                        allowRead: e.allowRead,
+                        allowWrite: e.allowWrite,
+                    })),
                 });
-
                 break;
             }
 
@@ -642,7 +667,7 @@ class SafeServer {
                             nonce: nonce,
                             publicData: publicData,
                         },
-                        select: {},
+                        // select: {},
                     });
 
                     wsUser.send({
@@ -957,6 +982,12 @@ class SafeSettings<T> {
 // const f = new SafeSettings().withType(zodToType("User", User)).withType(zodToType("Profile", Profile));
 // f.set("User");
 
+interface ClientGroup {
+    id: string;
+    publicKey: Uint8Array;
+    privateKey: Uint8Array;
+}
+
 class SafeClient<T extends Record<string, ObjectType>> {
     socket: WebSocket;
     responseHandlers = new Map<number, (msg: ClientMessage) => void>();
@@ -965,9 +996,8 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
     private userPublicKey?: Uint8Array;
     private userPrivateKey?: Uint8Array;
-    private groupPublicKey?: Uint8Array;
-    private groupPrivateKey?: Uint8Array;
-    private userGroupId?: string;
+    private groups?: ClientGroup[];
+    private selfGroupId?: string;
 
     static currentRequestId: number = 1;
 
@@ -1090,22 +1120,34 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
         const privateKey = sodium.crypto_aead_chacha20poly1305_decrypt(null, encryptedPrivateKey, null, encryptedPrivateKeyNonce, encryptionKey);
 
-        console.log("keypair", { publicKey, privateKey });
-
-        const groupPublicKey = decodeBase64(loginResponse.groupPublicKeyBase64);
-        const groupPrivateKey = sodium.crypto_box_seal_open(decodeBase64(loginResponse.groupEncryptedPrivateKeyBase64), publicKey, privateKey);
-
-        console.log("group keypair", {
-            id: loginResponse.groupId,
-            groupPublicKey,
-            groupPrivateKey,
-        });
+        // const groupPublicKey = decodeBase64(loginResponse.groupPublicKeyBase64);
+        // const groupPrivateKey = sodium.crypto_box_seal_open(decodeBase64(loginResponse.groupEncryptedPrivateKeyBase64), publicKey, privateKey);
+        // console.log("group keypair", {
+        //     id: loginResponse.groupId,
+        //     groupPublicKey,
+        //     groupPrivateKey,
+        // });
 
         this.userPublicKey = publicKey;
         this.userPrivateKey = privateKey;
-        this.groupPublicKey = groupPublicKey;
-        this.groupPrivateKey = groupPrivateKey;
-        this.userGroupId = loginResponse.groupId;
+        this.selfGroupId = loginResponse.selfGroupId;
+
+        // this.groupPublicKey = groupPublicKey;
+        // this.groupPrivateKey = groupPrivateKey;
+        // this.userGroupId = loginResponse.groupId;
+
+        this.groups = loginResponse.groups.map((e) => {
+            const groupPublicKey = decodeBase64(e.publicKeyBase64);
+            const groupPrivateKey = sodium.crypto_box_seal_open(decodeBase64(e.encryptedGroupPrivateKeyBase64), publicKey, privateKey);
+            return {
+                id: e.id,
+                publicKey: groupPublicKey,
+                privateKey: groupPrivateKey,
+            };
+        });
+
+        console.log("keypair", { publicKey, privateKey });
+        console.log("groups", this.groups);
 
         // for (const group of loginResponse.groups) {
         //     const groupPublicKey = decodeBase64(group.publicKeyBase64);
@@ -1140,10 +1182,6 @@ class SafeClient<T extends Record<string, ObjectType>> {
     async createRaw(typeName: string, privateData: Uint8Array, publicData: any | undefined): Promise<number> {
         await sodium.ready;
 
-        if (!this.userGroupId || !this.groupPublicKey) {
-            throw new Error("No key available");
-        }
-
         const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
         const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
 
@@ -1153,7 +1191,12 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
         console.log("Create key size", key.length, "nonce size", nonce.length, "nonce", nonceToInt(nonce));
 
-        const encryptedObjectKey = sodium.crypto_box_seal(key, this.groupPublicKey);
+        const selfGroup = this.getSelfGroup();
+        if (!selfGroup) {
+            throw new Error("No self group");
+        }
+
+        const encryptedObjectKey = sodium.crypto_box_seal(key, selfGroup.publicKey);
 
         const res = await this.request({
             type: "insert",
@@ -1162,30 +1205,27 @@ class SafeClient<T extends Record<string, ObjectType>> {
             nonceBase64: encodeBase64(nonce),
             publicData: publicData,
             encryptedObjectKeyBase64: encodeBase64(encryptedObjectKey),
-            // encryptedObjectKeyNonceBase64: encodeBase64(null),
-            groupId: this.userGroupId, // TODO
-
-            // version: 1,
+            groupId: selfGroup.id,
         });
         if (res.type !== "insert-response") {
             throw new Error();
         }
 
-        await this.storeKey(res.id, {
-            key: key,
-            nonce: nonce,
-        });
+        // await this.storeKey(res.id, {
+        //     key: key,
+        //     nonce: nonce,
+        // });
 
         return res.id;
     }
 
-    async getKey(id: number): Promise<StoredKey | undefined> {
-        return this.keyPerId.get(id);
-    }
+    // async getKey(id: number): Promise<StoredKey | undefined> {
+    //     return this.keyPerId.get(id);
+    // }
 
-    async storeKey(id: number, key: StoredKey) {
-        this.keyPerId.set(id, key);
-    }
+    // async storeKey(id: number, key: StoredKey) {
+    //     this.keyPerId.set(id, key);
+    // }
 
     async updateRaw(type: string, id: number, privateData: Uint8Array | undefined, publicData: any | undefined) {
         if (typeof privateData === "undefined") {
@@ -1204,18 +1244,31 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
         await sodium.ready;
 
-        const key = await this.getKey(id);
-        if (!key) {
-            throw new Error("Cannot update, no key");
+        // const key = await this.getKey(id);
+        // if (!key) {
+        //     throw new Error("Cannot update, no key");
+        // }
+
+        const getResponse = await this.request({ type: "get", objectType: type, id: id });
+        if (getResponse.type !== "get-response") throw new Error();
+
+        if (!getResponse.groupId || !getResponse.encryptedObjectKeyBase64 || !getResponse.nonceBase64) {
+            throw new Error("Object to update not found");
         }
 
-        const clientNonce = nonceToInt(key.nonce);
+        const group = this.getLocalGroup(getResponse.groupId);
+        if (!group) {
+            throw new Error("No object");
+        }
 
-        let newNonce = intToNonce(increment64(clientNonce, 1n));
-        let newKey = rotateKey(key.key, 1);
+        const key = sodium.crypto_box_seal_open(decodeBase64(getResponse.encryptedObjectKeyBase64), group.publicKey, group.privateKey);
+        const nonce = nonceToInt(decodeBase64(getResponse.nonceBase64));
+
+        let newNonce = intToNonce(increment64(nonce, 1n));
+        // let newKey = rotateKey(key, 1);
 
         while (true) {
-            const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(privateData, null, null, newNonce, newKey);
+            const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(privateData, null, null, newNonce, key);
 
             console.log("Encrypt", privateData.length, "->", cipher.length);
 
@@ -1231,20 +1284,20 @@ class SafeClient<T extends Record<string, ObjectType>> {
             if (res.type === "update-invalid-version") {
                 const serverNonce = nonceToInt(decodeBase64(res.nonceBase64));
 
-                const keyRotateCount = difference64(serverNonce, clientNonce);
-                if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
-                    throw new Error("Client has newer key than server, shouldn't be possible");
-                }
+                // const keyRotateCount = difference64(serverNonce, nonce);
+                // if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
+                //     throw new Error("Client has newer key than server, shouldn't be possible");
+                // }
 
-                console.log("Rotate key", keyRotateCount, "times in updateRaw", clientNonce, serverNonce);
+                // console.log("Rotate key", keyRotateCount, "times in updateRaw", nonce, serverNonce);
 
                 newNonce = intToNonce(increment64(serverNonce, 1n));
-                newKey = rotateKey(newKey, Number(keyRotateCount));
+                // newKey = rotateKey(newKey, Number(keyRotateCount));
             } else if (res.type === "update-response") {
-                await this.storeKey(id, {
-                    key: newKey,
-                    nonce: newNonce,
-                });
+                // await this.storeKey(id, {
+                //     key: newKey,
+                //     nonce: newNonce,
+                // });
                 break;
             } else {
                 throw new Error();
@@ -1259,42 +1312,60 @@ class SafeClient<T extends Record<string, ObjectType>> {
         }
     }
 
+    getLocalGroup(id: string) {
+        return this.groups?.find((e) => e.id === id);
+    }
+
+    getSelfGroup() {
+        if (!this.selfGroupId) {
+            return undefined;
+        }
+        return this.getLocalGroup(this.selfGroupId);
+    }
+
     async getRaw(type: string, id: number) {
         await sodium.ready;
 
-        const key = await this.getKey(id);
-        if (!key) {
-            throw new Error("No key for " + id);
-        }
+        // const key = await this.getKey(id);
+        // if (!key) {
+        //     throw new Error("No key for " + id);
+        // }
 
         const res = await this.request({ type: "get", objectType: type, id: id });
         if (res.type !== "get-response") {
             throw new Error();
         }
 
-        if (res.dataBase64 && res.nonceBase64) {
+        if (res.dataBase64 && res.nonceBase64 && res.encryptedObjectKeyBase64 && res.groupId) {
             const cipher = decodeBase64(res.dataBase64);
             const nonce = decodeBase64(res.nonceBase64);
 
-            let ciperKey = key.key;
-
-            const clientNonce = nonceToInt(key.nonce);
-            const serverNonce = nonceToInt(nonce);
-
-            if (clientNonce != serverNonce) {
-                const keyRotateCount = difference64(serverNonce, clientNonce);
-                if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
-                    throw new Error("Client has newer key than server, shouldn't be possible");
-                }
-
-                console.log("Rotate key", keyRotateCount, "times in getRaw", clientNonce, serverNonce);
-
-                ciperKey = rotateKey(ciperKey, Number(keyRotateCount));
-                await this.storeKey(id, {
-                    key: ciperKey,
-                    nonce: nonce,
-                });
+            const group = this.getLocalGroup(res.groupId);
+            if (!group) {
+                throw new Error("No local group");
             }
+
+            let ciperKey = sodium.crypto_box_seal_open(decodeBase64(res.encryptedObjectKeyBase64), group.publicKey, group.privateKey);
+
+            // let ciperKey = key.key;
+
+            // const clientNonce = nonceToInt(key.nonce);
+            // const serverNonce = nonceToInt(nonce);
+
+            // if (clientNonce != serverNonce) {
+            //     const keyRotateCount = difference64(serverNonce, clientNonce);
+            //     if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
+            //         throw new Error("Client has newer key than server, shouldn't be possible");
+            //     }
+
+            //     console.log("Rotate key", keyRotateCount, "times in getRaw", clientNonce, serverNonce);
+
+            //     ciperKey = rotateKey(ciperKey, Number(keyRotateCount));
+            //     await this.storeKey(id, {
+            //         key: ciperKey,
+            //         nonce: nonce,
+            //     });
+            // }
 
             const data = sodium.crypto_aead_chacha20poly1305_decrypt(null, cipher, null, nonce, ciperKey, "uint8array");
 
@@ -1453,8 +1524,31 @@ async function main() {
 
     const client = new SafeClient("ws://localhost:8080", settings);
 
-    // await client.login("stijn", "Vrijdag1@");
-    await client.login("stijn2", "Vrijdag1@");
+    await client.login("stijn", "Vrijdag1@");
+
+    await client.update("User", 1, {
+        private: {
+            age: 24,
+            name: "stijn rogiest (sr)",
+        },
+        public: {
+            email: "stijnvantvijfde@gmail.com",
+        },
+    });
+
+    const user = await client.get("User", 1);
+    console.log("obj", user);
+
+    // await client.create("User", {
+    //     private: {
+    //         name: "stijn",
+    //         age: 25,
+    //     },
+    //     public: {
+    //         email: "reddusted@gmail.com",
+    //     },
+    // });
+    // await client.login("stijn2", "Vrijdag1@");
 
     return;
 
