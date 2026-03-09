@@ -15,14 +15,6 @@ datasource db {
   provider = "postgresql"
 }
 
-// model Device {
-//   id          String @id @default(uuid())
-//   // user User
-
-//   publicKey Bytes
-//   encryptedUserPrivateKey
-// }
-
 model User {
   id          String @id @default(uuid())
   userName    String @unique
@@ -41,12 +33,10 @@ model User {
   encryptedPrivateKey      Bytes // Encrypted with encryptionKey, which is derived from the master user password
   encryptedPrivateKeyNonce Bytes
 
-  groups GroupUserPermission[]
-
-  // @@unique([id, selfGroupId])
+  groups GroupUser[]
 }
 
-model GroupUserPermission {
+model GroupUser {
   userId  String
   user    User   @relation(fields: [userId], references: [id])
   groupId String
@@ -67,65 +57,70 @@ model Group {
   publicKey Bytes
   // privateKey: stored in GroupUserPermission
 
-  users         GroupUserPermission[]
-  objects       ObjectGroupPermission[]
-  policies      GroupPolicy[]           @relation("policies")
-  otherPolicies GroupPolicy[]           @relation("otherPolicies")
+  users       GroupUser[]
+  collections GroupCollection[]
 }
 
-// "PublicMayEditRegistration" "PublicMayCreate"
-// "PublicMayReadRegistrations" 
-
-model GroupPolicy {
+model GroupCollection {
   groupId      String
-  group        Group           @relation(fields: [groupId], references: [id], name: "policies")
-  otherGroupId String
-  otherGroup   Group           @relation(fields: [otherGroupId], references: [id], name: "otherPolicies")
-  tableName    String
-  table        TableDescriptor @relation(fields: [tableName], references: [tableName])
+  group        Group      @relation(fields: [groupId], references: [id])
+  collectionId String
+  collection   Collection @relation(fields: [collectionId], references: [id])
 
-  allowReadWrite Boolean
-  writeFields    String[]
-  allowRead      Boolean
-  readFields     String[]
-  allowRemove    Boolean // deleting or unsharing object from group
-  allowAdd       Boolean // adding or sharing object with group
+  encryptedCollectionPrivateKey Bytes
 
-  @@id([groupId, otherGroupId, tableName])
+  canAdd      Boolean
+  canRemove   Boolean
+  canWrite    Boolean
+  canRead     Boolean
+  canQuery    Boolean
+  readFields  String[]
+  writeFields String[]
+
+  @@id([groupId, collectionId])
 }
 
-model TableDescriptor {
-  tableName   String @id @unique
-  description Json
+model Collection {
+  id      String             @id @default(uuid())
+  groups  GroupCollection[]
+  objects CollectionObject[]
 
-  tableBeliefs GroupPolicy[]
+  name      String
+  publicKey Bytes
+  // privateKey: stored in GroupCollection
 }
 
-model ObjectGroupPermission {
-  groupId  String
-  group    Group  @relation(fields: [groupId], references: [id])
-  objectId BigInt
-  object   Object @relation(fields: [objectId], references: [id])
+model CollectionObject {
+  collectionId String
+  collection   Collection @relation(fields: [collectionId], references: [id])
+  objectId     BigInt
+  object       Object     @relation(fields: [objectId], references: [id])
 
-  encryptedObjectKey Bytes // Encrypted using Group public key
+  encryptedObjectKey Bytes // Encrypted using Collection public key
   // encryptedObjectKeyNonce Bytes
   // encryptedColumnKeys Json // Encrypted
 
-  @@id([groupId, objectId])
+  @@id([collectionId, objectId])
+  @@index([collectionId])
 }
 
 model Object {
-  id         BigInt @id @default(autoincrement())
-  type       String // User specified type of the object, eg "ShoppingItem", "UserProfile"
+  id         BigInt          @id @default(autoincrement())
+  tableName  String // User specified type of the object, eg "ShoppingItem", "UserProfile"
+  table      TableDescriptor @relation(fields: [tableName], references: [tableName])
   data       Bytes
   nonce      Bytes
-  publicData Json?
+  publicData Json? // You can add indices on specific json fields using postgres create index
 
-  groups ObjectGroupPermission[]
-  // objectType ObjectType              @relation(fields: [type], references: [type])
+  collections CollectionObject[]
 
-  // @@index([publicData]) // Will only work for operations on the whole json
-  @@index([type])
+  @@index([tableName])
+}
+
+model TableDescriptor {
+  tableName   String   @id @unique
+  description Json
+  objects     Object[]
 }
 
 // model ObjectType {

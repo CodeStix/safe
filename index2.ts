@@ -5,7 +5,7 @@ import { IncomingMessage } from "http";
 import sodium from "libsodium-wrappers-sumo";
 import { RawData, WebSocket, WebSocketServer } from "ws";
 import * as z from "zod";
-import { Group, GroupBelief, GroupPolicy, PrismaClient } from "./prisma/prisma/client";
+import { Group, PrismaClient } from "./prisma/prisma/client";
 import { PrismaPromise } from "@prisma/client/runtime/client";
 
 // type ObjectTypeName = string;
@@ -44,18 +44,18 @@ type ServerMessage =
       }
     | {
           type: "insert";
-          objectType: string;
+          tableName: string;
           dataBase64: string;
           nonceBase64: string;
           publicData: any;
-          groupId: string;
+          collectionId: string;
           encryptedObjectKeyBase64: string;
           //   encryptedObjectKeyNonceBase64: string;
       }
     | {
           type: "update";
           id: number;
-          objectType: string;
+          tableName: string;
           dataBase64?: string;
           nonceBase64?: string;
           publicData?: any;
@@ -63,11 +63,12 @@ type ServerMessage =
     | {
           type: "get";
           id: number;
-          objectType: string;
+          tableName: string;
       }
     | {
           type: "query";
-          objectType: string;
+          tableName: string;
+          collectionId: string;
           query: Record<string, any>;
       }
     | {
@@ -179,7 +180,7 @@ type ClientMessage =
           dataBase64?: string;
           nonceBase64?: string;
           publicData?: any;
-          groupId?: string;
+          collectionId?: string;
           encryptedObjectKeyBase64?: string;
           //   encryptedObjectKeyNonceBase64?: string;
           //   version?: number;
@@ -197,7 +198,7 @@ type ClientMessage =
               dataBase64: string,
               nonceBase64: string,
               publicData: any,
-              groupId: string,
+              collectionId: string,
               encryptedObjectKeyBase64: string
               //   encryptedObjectKeyNonceBase64: string
           ][];
@@ -334,104 +335,6 @@ class SafeServer {
     //     }
     // }
 
-    getEffectivePermissions(
-        tableName: string,
-        userGroups: { groupId: string }[],
-        objectGroups: { group: { policies: GroupPolicy[] } }[]
-    ): {
-        allowAdd: boolean;
-        allowRemove: boolean;
-        allowRead: boolean;
-        allowWrite: boolean;
-        readFields: Set<string> | null;
-        writeFields: Set<string> | null;
-    } {
-        let combinedAllowAdd = false;
-        let combinedAllowRemove = false;
-        let combinedAllowRead = false;
-        let combinedReadFields: Set<string> | null = null;
-        let combinedAllowWrite = false;
-        let combinedWriteFields: Set<string> | null = null;
-
-        for (let i = 0; i < objectGroups.length; i++) {
-            const group = objectGroups[i]!;
-
-            let allowAdd = false;
-            let allowRemove = false;
-            let allowRead = false;
-            let readFields: Set<string> | null = null;
-            let allowWrite = false;
-            let writeFields: Set<string> | null = null;
-
-            for (const policy of group.group.policies) {
-                if (policy.tableName !== tableName) {
-                    // Belief not relevant: wrong table
-                    continue;
-                }
-                if (!userGroups.some((e) => e.groupId === policy.otherGroupId)) {
-                    // Belief not relevant: user not in related group
-                    continue;
-                }
-
-                if (policy.allowAdd) {
-                    allowAdd = true;
-                }
-                if (policy.allowRemove) {
-                    allowRemove = true;
-                }
-                if (policy.allowRead) {
-                    allowRead = true;
-                    if (policy.readFields.length > 0) {
-                        if (readFields === null) {
-                            readFields = new Set<string>();
-                        }
-                        policy.readFields.forEach((e) => readFields!.add(e));
-                    }
-                }
-                if (policy.allowReadWrite) {
-                    allowWrite = true;
-                    if (policy.writeFields.length > 0) {
-                        if (writeFields === null) {
-                            writeFields = new Set<string>();
-                        }
-                        policy.writeFields.forEach((e) => writeFields!.add(e));
-                    }
-                }
-            }
-
-            if (i === 0) {
-                combinedAllowAdd = allowAdd;
-                combinedAllowRemove = allowRemove;
-                combinedAllowRead = allowRead;
-                combinedReadFields = readFields;
-                combinedAllowWrite = allowWrite;
-                combinedWriteFields = writeFields;
-            } else {
-                combinedAllowAdd = combinedAllowAdd && allowAdd;
-                combinedAllowRemove = combinedAllowRemove && allowRemove;
-                combinedAllowRead = combinedAllowRead && allowRead;
-                combinedReadFields =
-                    combinedReadFields === null ? readFields : readFields === null ? combinedReadFields : combinedReadFields.intersection(readFields);
-                combinedAllowWrite = combinedAllowWrite && allowWrite;
-                combinedWriteFields =
-                    combinedWriteFields === null
-                        ? writeFields
-                        : writeFields === null
-                        ? combinedWriteFields
-                        : combinedWriteFields.intersection(writeFields);
-            }
-        }
-
-        return {
-            allowAdd: combinedAllowAdd,
-            allowRead: combinedAllowRead,
-            allowWrite: combinedAllowWrite,
-            allowRemove: combinedAllowRemove,
-            readFields: combinedReadFields,
-            writeFields: combinedWriteFields,
-        };
-    }
-
     async handleMessage(ws: WebSocket, msg: ServerMessage & { request: number }) {
         const wsUser = this.userPerSocket.get(ws) ?? new AuthenticatedUser(ws, undefined);
         const user = await wsUser.getUser(this.prisma);
@@ -508,7 +411,7 @@ class SafeServer {
                         },
                     });
 
-                    await prisma.groupUserPermission.create({
+                    await prisma.groupUser.create({
                         data: {
                             encryptedGroupPrivateKey: groupEncryptedPrivateKey,
                             groupId: group.id,
@@ -677,7 +580,7 @@ class SafeServer {
                     break;
                 }
 
-                const objectType = this.getType(msg.objectType);
+                const objectType = this.getType(msg.tableName);
                 if (!objectType) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
                     break;
@@ -703,30 +606,41 @@ class SafeServer {
                     }
                 }
 
+                const userRights = await this.prisma.groupCollection.findFirst({
+                    where: {
+                        collectionId: msg.collectionId,
+                        group: {
+                            users: {
+                                some: {
+                                    userId: user.id,
+                                },
+                            },
+                        },
+                        canAdd: true,
+                    },
+                    select: {
+                        readFields: true,
+                        writeFields: true,
+                    },
+                });
+
+                if (!userRights) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to add object to collection" });
+                    break;
+                }
+
                 const encryptedObjectKey = Buffer.from(msg.encryptedObjectKeyBase64, "base64");
-                // const encryptedObjectKeyNonce = Buffer.from(msg.encryptedObjectKeyNonceBase64, "base64");
 
                 const obj = await this.prisma.object.create({
                     data: {
-                        type: objectType.name,
+                        tableName: objectType.name,
                         data: data,
                         nonce: nonce,
                         publicData: publicData,
-                        groups: {
+                        collections: {
                             create: {
                                 encryptedObjectKey: encryptedObjectKey,
-                                // encryptedObjectKeyNonce: encryptedObjectKeyNonce,
-                                group: {
-                                    connect: {
-                                        id: msg.groupId,
-                                        users: {
-                                            some: {
-                                                userId: user.id,
-                                                // allowCreate: true,
-                                            },
-                                        },
-                                    },
-                                },
+                                collectionId: msg.collectionId,
                             },
                         },
                     },
@@ -750,111 +664,63 @@ class SafeServer {
                         return;
                     }
 
-                    const objectType = this.getType(msg.objectType);
-                    if (!objectType) {
-                        wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
-                        return;
-                    }
+                    // const objectType = this.getType(msg.tableName);
+                    // if (!objectType) {
+                    //     wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
+                    //     return;
+                    // }
 
-                    // const newGroup = db.newGroup("Test_0_Registrations", {
-                    //     beliefs: {
-                    //         "TestRegistration": [{
-                    //             group: null, // "Test_0_Registrations"
-                    //             allowRead: true,
-                    //             allowReadWrite: true,
-                    //             allowAdd: true,
-                    //             allowRemove: true,
-                    //         }, {
-                    //             group: db.getPublicGroup(),
-                    //             allowRead: true,
-                    //             readFields: ["status", "cancelled"],
-                    //             allowReadWrite: true,
-                    //             writeFields: ["cancelled"],
-                    //             allowAdd: true,
-                    //             addFields: [], // allow no fields to be set during share
-                    //             allowRemove: true,
-                    //         }],
-                    //         "UserProfile": [{
-                    //             group: null, // "Test_0_Registrations"
-                    //             allowRead: true,
-                    //         }, {
-                    //             group: db.getPublicGroup(),
-                    //             allowRead: true,
-                    //             allowReadWrite: true,
-                    //             allowAdd: true,
-                    //             allowRemove: true,
-                    //         }]
-                    //     },
-                    // });
-
-                    const existingObj = await this.prisma.object.findUniqueOrThrow({
+                    const userRights = await this.prisma.groupCollection.findFirst({
                         where: {
-                            id: msg.id!,
-                            type: objectType.name,
-                            groups: {
-                                every: {
-                                    group: {
-                                        users: {
-                                            some: {
-                                                userId: user.id,
-                                            },
-                                        },
+                            collection: {
+                                objects: {
+                                    some: {
+                                        objectId: msg.id,
                                     },
                                 },
                             },
+                            group: {
+                                users: {
+                                    some: {
+                                        userId: user.id,
+                                    },
+                                },
+                            },
+                            canWrite: true,
+                        },
+                        select: {
+                            readFields: true,
+                            writeFields: true,
+                        },
+                    });
+
+                    if (!userRights) {
+                        wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to modify object in collection" });
+                        return;
+                    }
+
+                    const existingObj = await this.prisma.object.findUniqueOrThrow({
+                        where: {
+                            id: msg.id,
                         },
                         select: {
                             id: true,
                             data: true,
                             nonce: true,
                             publicData: true,
-                            groups: {
-                                select: {
-                                    group: {
-                                        select: {
-                                            policies: {
-                                                where: {
-                                                    table: {
-                                                        tableName: objectType.name,
-                                                    },
-                                                },
-                                                select: {
-                                                    tableName: true,
-                                                    groupId: true,
-                                                    otherGroupId: true,
-                                                    allowAdd: true,
-                                                    allowRemove: true,
-                                                    allowRead: true,
-                                                    readFields: true,
-                                                    allowReadWrite: true,
-                                                    writeFields: true,
-                                                },
-                                            },
-                                        },
-                                    },
-                                },
-                            },
                         },
                     });
 
-                    // stijn rogiest reddusted@gmail.com 0031634887006
-                    // db.share(userObj, ["firstName", "lastNameLetter", "email", "telephoneNumber"], testRegistrationsGroup)
-                    // db.share(userObj, ["firstName", "lastNameLetter", "email", "telephoneNumber"], testRegistrationsGroup)
-                    // db.share(userObj, ["firstName", "email"], emailGroup)
-                    // db.share(userObj, ["firstName", "telephoneNumber"], emailGroup)
-                    // db.share(testRegistration, ["testId"], emailGroup)
-
-                    const userPermissions = this.getEffectivePermissions(objectType.name, user.groups, existingObj.groups);
-
                     let data: Buffer<ArrayBuffer> | undefined = undefined;
                     let nonce: Buffer<ArrayBuffer> | undefined = undefined;
-                    let publicData: any | undefined = undefined;
+                    // let publicData: any | undefined = undefined;
 
                     if (msg.dataBase64 && msg.nonceBase64) {
                         data = Buffer.from(msg.dataBase64, "base64");
                         nonce = Buffer.from(msg.nonceBase64, "base64");
 
-                        if (nonce.length !== 8 || data.length > objectType.privateDataMaxSize) {
+                        const privateDataMaxSize = 1000; // TODO add somewhere
+                        if (nonce.length !== 8 || data.length > privateDataMaxSize) {
                             wsUser.send({ type: "error-response", request: msg.request, message: "Invalid private data" });
                             return;
                         }
@@ -871,15 +737,25 @@ class SafeServer {
                         }
                     }
 
-                    if (typeof msg.publicData !== "undefined") {
-                        try {
-                            publicData = objectType.publicDataValidator(msg.publicData);
-                        } catch (ex) {
-                            console.error("Could not validate public data", ex);
-                            wsUser.send({ type: "error-response", request: msg.request, message: "Invalid public data" });
-                            return;
+                    // TODO: validate private data as well
+                    const publicData = (existingObj.publicData ?? {}) as any;
+                    if (msg.publicData) {
+                        for (const k in msg.publicData) {
+                            if (userRights.writeFields.length <= 0 || userRights.writeFields.includes(k)) {
+                                publicData[k] = msg.publicData[k];
+                            }
                         }
                     }
+
+                    // if (typeof msg.publicData !== "undefined") {
+                    //     try {
+                    //         publicData = objectType.publicDataValidator(msg.publicData);
+                    //     } catch (ex) {
+                    //         console.error("Could not validate public data", ex);
+                    //         wsUser.send({ type: "error-response", request: msg.request, message: "Invalid public data" });
+                    //         return;
+                    //     }
+                    // }
 
                     await this.prisma.object.update({
                         where: {
@@ -996,43 +872,43 @@ class SafeServer {
                 break;
             }
 
-            case "create-group": {
-                const group = await this.prisma.$transaction(async (prisma) => {
-                    const group = await prisma.group.create({
-                        data: {
-                            name: msg.groupName,
-                            publicKey: Buffer.from(msg.publicKeyBase64, "base64"),
-                        },
-                        select: {
-                            id: true,
-                        },
-                    });
+            // case "create-group": {
+            //     const group = await this.prisma.$transaction(async (prisma) => {
+            //         const group = await prisma.group.create({
+            //             data: {
+            //                 name: msg.groupName,
+            //                 publicKey: Buffer.from(msg.publicKeyBase64, "base64"),
+            //             },
+            //             select: {
+            //                 id: true,
+            //             },
+            //         });
 
-                    await prisma.groupPolicy.createMany({
-                        data: msg.policies.map((e) => ({
-                            groupId: group.id,
-                            otherGroupId: e.otherGroupId ?? group.id,
-                            tableName: e.tableName,
-                            allowAdd: e.allowAdd ?? false,
-                            allowRemove: e.allowRemove ?? false,
-                            allowRead: e.allowRead ?? false,
-                            allowReadWrite: e.allowReadWrite ?? false,
-                            readFields: e.readFields ?? [], // default: empty means all
-                            writeFields: e.writeFields ?? [], // default: empty means all
-                        })),
-                    });
+            //         await prisma.groupPolicy.createMany({
+            //             data: msg.policies.map((e) => ({
+            //                 groupId: group.id,
+            //                 otherGroupId: e.otherGroupId ?? group.id,
+            //                 tableName: e.tableName,
+            //                 allowAdd: e.allowAdd ?? false,
+            //                 allowRemove: e.allowRemove ?? false,
+            //                 allowRead: e.allowRead ?? false,
+            //                 allowReadWrite: e.allowReadWrite ?? false,
+            //                 readFields: e.readFields ?? [], // default: empty means all
+            //                 writeFields: e.writeFields ?? [], // default: empty means all
+            //             })),
+            //         });
 
-                    return group;
-                });
+            //         return group;
+            //     });
 
-                wsUser.send({
-                    type: "create-group-response",
-                    request: msg.request,
-                    groupId: group.id,
-                });
+            //     wsUser.send({
+            //         type: "create-group-response",
+            //         request: msg.request,
+            //         groupId: group.id,
+            //     });
 
-                break;
-            }
+            //     break;
+            // }
 
             // case "update-group": {
             //     await this.prisma.groupPolicy.up({
@@ -1048,11 +924,37 @@ class SafeServer {
                     break;
                 }
 
-                const objectType = this.getType(msg.objectType);
-                if (!objectType) {
-                    wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
-                    break;
+                const collectionId = msg.collectionId;
+
+                const userRights = await this.prisma.groupCollection.findMany({
+                    where: {
+                        collectionId: collectionId,
+                        group: {
+                            users: {
+                                some: {
+                                    userId: user.id,
+                                },
+                            },
+                        },
+                        canRead: true,
+                        canQuery: true,
+                    },
+                    select: {
+                        readFields: true,
+                        writeFields: true,
+                    },
+                });
+
+                if (userRights.length <= 0) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to query objects in collection" });
+                    return;
                 }
+
+                // const objectType = this.getType(msg.objectType);
+                // if (!objectType) {
+                //     wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
+                //     break;
+                // }
 
                 const queries = [] as { publicData: { path: string[]; equals: string } }[];
                 for (const [k, v] of Object.entries(msg.query)) {
@@ -1061,17 +963,25 @@ class SafeServer {
 
                 const obj = await this.prisma.object.findMany({
                     where: {
-                        type: objectType.name,
-                        groups: {
+                        tableName: msg.tableName,
+                        collections: {
                             some: {
-                                group: {
-                                    users: {
-                                        some: {
-                                            allowRead: true,
-                                            userId: user.id,
-                                        },
-                                    },
-                                },
+                                collectionId: collectionId,
+                                // collection: {
+                                //     groups: {
+                                //         some: {
+                                //             canQuery: true,
+                                //             canRead: true,
+                                //             group: {
+                                //                 users: {
+                                //                     some: {
+                                //                         userId: user.id,
+                                //                     },
+                                //                 },
+                                //             },
+                                //         },
+                                //     },
+                                // },
                             },
                         },
                         AND: queries,
@@ -1081,22 +991,13 @@ class SafeServer {
                         data: true,
                         nonce: true,
                         publicData: true,
-                        groups: {
-                            take: 1,
+                        collections: {
                             where: {
-                                group: {
-                                    users: {
-                                        some: {
-                                            allowRead: true,
-                                            userId: user.id,
-                                        },
-                                    },
-                                },
+                                collectionId: collectionId,
                             },
                             select: {
-                                groupId: true,
+                                collectionId: true,
                                 encryptedObjectKey: true,
-                                // encryptedObjectKeyNonce: true,
                             },
                         },
                     },
@@ -1107,20 +1008,20 @@ class SafeServer {
                     dataBase64: string,
                     nonceBase64: string,
                     publicData: any,
-                    groupId: string,
+                    collectionId: string,
                     encryptedObjectKeyBase64: string
                     // encryptedObjectKeyNonceBase64: string
                 ][] = [];
 
                 for (const row of obj) {
-                    const group = row.groups[0]!;
+                    const collection = row.collections[0]!;
                     convertedData.push([
                         Number(row.id),
                         Buffer.from(row.data).toString("base64"),
                         Buffer.from(row.nonce).toString("base64"),
                         row.publicData,
-                        group.groupId,
-                        Buffer.from(group.encryptedObjectKey).toString("base64"),
+                        collection.collectionId,
+                        Buffer.from(collection.encryptedObjectKey).toString("base64"),
                         // Buffer.from(group.encryptedObjectKeyNonce).toString("base64"),
                     ]);
                 }
@@ -1140,64 +1041,74 @@ class SafeServer {
                     break;
                 }
 
-                const objectType = this.getType(msg.objectType);
-                if (!objectType) {
-                    wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
+                // const objectType = this.getType(msg.objectType);
+                // if (!objectType) {
+                //     wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
+                //     break;
+                // }
+
+                const userRights = await this.prisma.groupCollection.findMany({
+                    where: {
+                        collection: {
+                            objects: {
+                                some: {
+                                    objectId: msg.id,
+                                },
+                            },
+                        },
+                        group: {
+                            users: {
+                                some: {
+                                    userId: user.id,
+                                },
+                            },
+                        },
+                        canRead: true,
+                    },
+                    select: {
+                        collectionId: true,
+                        readFields: true,
+                        writeFields: true,
+                    },
+                });
+
+                if (userRights.length <= 0) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to read objects in collection" });
                     break;
                 }
 
                 const obj = await this.prisma.object.findUnique({
                     where: {
                         id: msg.id,
-                        type: objectType.name,
-                        groups: {
-                            some: {
-                                group: {
-                                    users: {
-                                        some: {
-                                            allowRead: true,
-                                            userId: user.id,
-                                        },
-                                    },
-                                },
-                            },
-                        },
+                        tableName: msg.tableName,
                     },
                     select: {
                         data: true,
                         nonce: true,
                         publicData: true,
-                        groups: {
+                        collections: {
                             take: 1,
                             where: {
-                                group: {
-                                    users: {
-                                        some: {
-                                            allowRead: true,
-                                            userId: user.id,
-                                        },
-                                    },
-                                },
+                                collectionId: userRights[0]!.collectionId,
                             },
                             select: {
-                                groupId: true,
+                                collectionId: true,
                                 encryptedObjectKey: true,
-                                // encryptedObjectKeyNonce: true,
                             },
                         },
                     },
                 });
 
                 if (obj) {
-                    const group = obj.groups[0]!;
+                    const collection = obj.collections[0]!;
                     wsUser.send({
                         type: "get-response",
                         request: msg.request,
                         dataBase64: Buffer.from(obj.data).toString("base64"),
                         nonceBase64: Buffer.from(obj.nonce).toString("base64"),
                         publicData: obj.publicData,
-                        groupId: group.groupId,
-                        encryptedObjectKeyBase64: Buffer.from(group.encryptedObjectKey).toString("base64"),
+                        collectionId: collection.collectionId,
+                        encryptedObjectKeyBase64: Buffer.from(collection.encryptedObjectKey).toString("base64"),
                         // encryptedObjectKeyNonceBase64: Buffer.from(group.encryptedObjectKeyNonce).toString("base64"),
                     });
                 } else {
@@ -1561,7 +1472,7 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
         const res = await this.request({
             type: "insert",
-            objectType: typeName,
+            tableName: typeName,
             dataBase64: encodeBase64(cipher),
             nonceBase64: encodeBase64(nonce),
             publicData: publicData,
@@ -1596,7 +1507,7 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
             await this.request({
                 type: "update",
-                objectType: type,
+                tableName: type,
                 publicData: publicData,
                 id: id,
             });
@@ -1613,11 +1524,11 @@ class SafeClient<T extends Record<string, ObjectType>> {
         const getResponse = await this.request({ type: "get", objectType: type, id: id });
         if (getResponse.type !== "get-response") throw new Error();
 
-        if (!getResponse.groupId || !getResponse.encryptedObjectKeyBase64 || !getResponse.nonceBase64) {
+        if (!getResponse.collectionId || !getResponse.encryptedObjectKeyBase64 || !getResponse.nonceBase64) {
             throw new Error("Object to update not found");
         }
 
-        const group = this.getLocalGroup(getResponse.groupId);
+        const group = this.getLocalGroup(getResponse.collectionId);
         if (!group) {
             throw new Error("No object");
         }
@@ -1635,7 +1546,7 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
             const res = await this.request({
                 type: "update",
-                objectType: type,
+                tableName: type,
                 dataBase64: encodeBase64(cipher),
                 nonceBase64: encodeBase64(newNonce),
                 publicData: publicData,
@@ -1697,11 +1608,11 @@ class SafeClient<T extends Record<string, ObjectType>> {
             throw new Error();
         }
 
-        if (res.dataBase64 && res.nonceBase64 && res.encryptedObjectKeyBase64 && res.groupId) {
+        if (res.dataBase64 && res.nonceBase64 && res.encryptedObjectKeyBase64 && res.collectionId) {
             const cipher = decodeBase64(res.dataBase64);
             const nonce = decodeBase64(res.nonceBase64);
 
-            const group = this.getLocalGroup(res.groupId);
+            const group = this.getLocalGroup(res.collectionId);
             if (!group) {
                 throw new Error("No local group");
             }
