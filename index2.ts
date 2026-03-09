@@ -1,13 +1,12 @@
-import "dotenv/config";
-import sodium from "libsodium-wrappers-sumo";
-import { WebSocket, WebSocketServer, RawData } from "ws";
-import { IncomingMessage } from "http";
-import { PrismaClient } from "./prisma/prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
 import AsyncLock from "async-lock";
-import { PrismaClientKnownRequestError } from "@prisma/client/runtime/client";
-import { ObjectCreateInput } from "./prisma/prisma/models";
+import "dotenv/config";
+import { IncomingMessage } from "http";
+import sodium from "libsodium-wrappers-sumo";
+import { RawData, WebSocket, WebSocketServer } from "ws";
 import * as z from "zod";
+import { Group, GroupBelief, GroupPolicy, PrismaClient } from "./prisma/prisma/client";
+import { PrismaPromise } from "@prisma/client/runtime/client";
 
 // type ObjectTypeName = string;
 
@@ -73,6 +72,51 @@ type ServerMessage =
       }
     | {
           type: "get-user-groups";
+      }
+    | {
+          type: "upsert-table";
+          tableName: string;
+          description: TableColumnDescription[];
+      }
+    | {
+          type: "create-group";
+          groupName: string;
+          publicKeyBase64: string;
+          policies: GroupPolicyDescription[];
+      }
+    | {
+          type: "update-group";
+          groupId: string;
+          policies: GroupPolicyDescription[];
+      };
+
+type GroupPolicyDescription = {
+    tableName: string;
+    otherGroupId?: string;
+
+    allowReadWrite?: boolean;
+    writeFields?: string[];
+    allowRead?: boolean;
+    readFields?: string[];
+    allowRemove?: boolean; // deleting or unsharing object from group
+    allowAdd?: boolean; // adding or sharing object with group
+};
+
+type TableColumnDescription =
+    | {
+          type: "TEXT";
+          name: string;
+          encrypted: boolean;
+      }
+    | {
+          type: "INT";
+          name: string;
+          encrypted: boolean;
+      }
+    | {
+          type: "BIGINT";
+          name: string;
+          encrypted: boolean;
       };
 
 // type ServerRequestMessage = ServerMessage & { request: number };
@@ -108,9 +152,9 @@ type ClientMessage =
               id: string;
               publicKeyBase64: string;
               encryptedGroupPrivateKeyBase64: string;
-              allowCreate: boolean;
-              allowRead: boolean;
-              allowWrite: boolean;
+              //   allowCreate: boolean;
+              //   allowRead: boolean;
+              //   allowWrite: boolean;
           }[];
       }
     | {
@@ -166,10 +210,19 @@ type ClientMessage =
               id: string;
               publicKeyBase64: string;
               encryptedGroupPrivateKeyBase64: string;
-              allowCreate: boolean;
-              allowRead: boolean;
-              allowWrite: boolean;
+              //   allowCreate: boolean;
+              //   allowRead: boolean;
+              //   allowWrite: boolean;
           }[];
+      }
+    | {
+          type: "upsert-table-response";
+          request: number;
+      }
+    | {
+          type: "create-group-response";
+          request: number;
+          groupId: string;
       };
 
 class AuthenticatedUser {
@@ -183,7 +236,16 @@ class AuthenticatedUser {
         if (!this.userId) {
             return null;
         }
-        return await prisma.user.findUnique({ where: { id: this.userId } });
+        return await prisma.user.findUnique({
+            where: { id: this.userId },
+            include: {
+                groups: {
+                    select: {
+                        groupId: true,
+                    },
+                },
+            },
+        });
     }
 }
 
@@ -272,6 +334,104 @@ class SafeServer {
     //     }
     // }
 
+    getEffectivePermissions(
+        tableName: string,
+        userGroups: { groupId: string }[],
+        objectGroups: { group: { policies: GroupPolicy[] } }[]
+    ): {
+        allowAdd: boolean;
+        allowRemove: boolean;
+        allowRead: boolean;
+        allowWrite: boolean;
+        readFields: Set<string> | null;
+        writeFields: Set<string> | null;
+    } {
+        let combinedAllowAdd = false;
+        let combinedAllowRemove = false;
+        let combinedAllowRead = false;
+        let combinedReadFields: Set<string> | null = null;
+        let combinedAllowWrite = false;
+        let combinedWriteFields: Set<string> | null = null;
+
+        for (let i = 0; i < objectGroups.length; i++) {
+            const group = objectGroups[i]!;
+
+            let allowAdd = false;
+            let allowRemove = false;
+            let allowRead = false;
+            let readFields: Set<string> | null = null;
+            let allowWrite = false;
+            let writeFields: Set<string> | null = null;
+
+            for (const policy of group.group.policies) {
+                if (policy.tableName !== tableName) {
+                    // Belief not relevant: wrong table
+                    continue;
+                }
+                if (!userGroups.some((e) => e.groupId === policy.otherGroupId)) {
+                    // Belief not relevant: user not in related group
+                    continue;
+                }
+
+                if (policy.allowAdd) {
+                    allowAdd = true;
+                }
+                if (policy.allowRemove) {
+                    allowRemove = true;
+                }
+                if (policy.allowRead) {
+                    allowRead = true;
+                    if (policy.readFields.length > 0) {
+                        if (readFields === null) {
+                            readFields = new Set<string>();
+                        }
+                        policy.readFields.forEach((e) => readFields!.add(e));
+                    }
+                }
+                if (policy.allowReadWrite) {
+                    allowWrite = true;
+                    if (policy.writeFields.length > 0) {
+                        if (writeFields === null) {
+                            writeFields = new Set<string>();
+                        }
+                        policy.writeFields.forEach((e) => writeFields!.add(e));
+                    }
+                }
+            }
+
+            if (i === 0) {
+                combinedAllowAdd = allowAdd;
+                combinedAllowRemove = allowRemove;
+                combinedAllowRead = allowRead;
+                combinedReadFields = readFields;
+                combinedAllowWrite = allowWrite;
+                combinedWriteFields = writeFields;
+            } else {
+                combinedAllowAdd = combinedAllowAdd && allowAdd;
+                combinedAllowRemove = combinedAllowRemove && allowRemove;
+                combinedAllowRead = combinedAllowRead && allowRead;
+                combinedReadFields =
+                    combinedReadFields === null ? readFields : readFields === null ? combinedReadFields : combinedReadFields.intersection(readFields);
+                combinedAllowWrite = combinedAllowWrite && allowWrite;
+                combinedWriteFields =
+                    combinedWriteFields === null
+                        ? writeFields
+                        : writeFields === null
+                        ? combinedWriteFields
+                        : combinedWriteFields.intersection(writeFields);
+            }
+        }
+
+        return {
+            allowAdd: combinedAllowAdd,
+            allowRead: combinedAllowRead,
+            allowWrite: combinedAllowWrite,
+            allowRemove: combinedAllowRemove,
+            readFields: combinedReadFields,
+            writeFields: combinedWriteFields,
+        };
+    }
+
     async handleMessage(ws: WebSocket, msg: ServerMessage & { request: number }) {
         const wsUser = this.userPerSocket.get(ws) ?? new AuthenticatedUser(ws, undefined);
         const user = await wsUser.getUser(this.prisma);
@@ -325,6 +485,7 @@ class SafeServer {
                     const group = await prisma.group.create({
                         data: {
                             publicKey: groupPublicKey,
+                            name: "UserGroup",
                         },
                     });
 
@@ -350,9 +511,6 @@ class SafeServer {
                     await prisma.groupUserPermission.create({
                         data: {
                             encryptedGroupPrivateKey: groupEncryptedPrivateKey,
-                            allowCreate: true,
-                            allowRead: true,
-                            allowWrite: true,
                             groupId: group.id,
                             userId: user.id,
                         },
@@ -415,9 +573,9 @@ class SafeServer {
                         groups: {
                             select: {
                                 encryptedGroupPrivateKey: true,
-                                allowCreate: true,
-                                allowRead: true,
-                                allowWrite: true,
+                                // allowCreate: true,
+                                // allowRead: true,
+                                // allowWrite: true,
                                 group: {
                                     select: {
                                         id: true,
@@ -460,9 +618,9 @@ class SafeServer {
                         id: e.group.id,
                         publicKeyBase64: encodeBase64(e.group.publicKey),
                         encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
-                        allowCreate: e.allowCreate,
-                        allowRead: e.allowRead,
-                        allowWrite: e.allowWrite,
+                        // allowCreate: e.allowCreate,
+                        // allowRead: e.allowRead,
+                        // allowWrite: e.allowWrite,
                     })),
                 });
                 break;
@@ -483,9 +641,9 @@ class SafeServer {
                         groups: {
                             select: {
                                 encryptedGroupPrivateKey: true,
-                                allowCreate: true,
-                                allowRead: true,
-                                allowWrite: true,
+                                // allowCreate: true,
+                                // allowRead: true,
+                                // allowWrite: true,
                                 group: {
                                     select: {
                                         id: true,
@@ -505,9 +663,9 @@ class SafeServer {
                         id: e.group.id,
                         publicKeyBase64: encodeBase64(e.group.publicKey),
                         encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
-                        allowCreate: e.allowCreate,
-                        allowRead: e.allowRead,
-                        allowWrite: e.allowWrite,
+                        // allowCreate: e.allowCreate,
+                        // allowRead: e.allowRead,
+                        // allowWrite: e.allowWrite,
                     })),
                 });
                 break;
@@ -564,7 +722,7 @@ class SafeServer {
                                         users: {
                                             some: {
                                                 userId: user.id,
-                                                allowCreate: true,
+                                                // allowCreate: true,
                                             },
                                         },
                                     },
@@ -598,17 +756,47 @@ class SafeServer {
                         return;
                     }
 
+                    // const newGroup = db.newGroup("Test_0_Registrations", {
+                    //     beliefs: {
+                    //         "TestRegistration": [{
+                    //             group: null, // "Test_0_Registrations"
+                    //             allowRead: true,
+                    //             allowReadWrite: true,
+                    //             allowAdd: true,
+                    //             allowRemove: true,
+                    //         }, {
+                    //             group: db.getPublicGroup(),
+                    //             allowRead: true,
+                    //             readFields: ["status", "cancelled"],
+                    //             allowReadWrite: true,
+                    //             writeFields: ["cancelled"],
+                    //             allowAdd: true,
+                    //             addFields: [], // allow no fields to be set during share
+                    //             allowRemove: true,
+                    //         }],
+                    //         "UserProfile": [{
+                    //             group: null, // "Test_0_Registrations"
+                    //             allowRead: true,
+                    //         }, {
+                    //             group: db.getPublicGroup(),
+                    //             allowRead: true,
+                    //             allowReadWrite: true,
+                    //             allowAdd: true,
+                    //             allowRemove: true,
+                    //         }]
+                    //     },
+                    // });
+
                     const existingObj = await this.prisma.object.findUniqueOrThrow({
                         where: {
                             id: msg.id!,
                             type: objectType.name,
                             groups: {
-                                some: {
+                                every: {
                                     group: {
                                         users: {
                                             some: {
                                                 userId: user.id,
-                                                allowWrite: true,
                                             },
                                         },
                                     },
@@ -620,8 +808,43 @@ class SafeServer {
                             data: true,
                             nonce: true,
                             publicData: true,
+                            groups: {
+                                select: {
+                                    group: {
+                                        select: {
+                                            policies: {
+                                                where: {
+                                                    table: {
+                                                        tableName: objectType.name,
+                                                    },
+                                                },
+                                                select: {
+                                                    tableName: true,
+                                                    groupId: true,
+                                                    otherGroupId: true,
+                                                    allowAdd: true,
+                                                    allowRemove: true,
+                                                    allowRead: true,
+                                                    readFields: true,
+                                                    allowReadWrite: true,
+                                                    writeFields: true,
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
                         },
                     });
+
+                    // stijn rogiest reddusted@gmail.com 0031634887006
+                    // db.share(userObj, ["firstName", "lastNameLetter", "email", "telephoneNumber"], testRegistrationsGroup)
+                    // db.share(userObj, ["firstName", "lastNameLetter", "email", "telephoneNumber"], testRegistrationsGroup)
+                    // db.share(userObj, ["firstName", "email"], emailGroup)
+                    // db.share(userObj, ["firstName", "telephoneNumber"], emailGroup)
+                    // db.share(testRegistration, ["testId"], emailGroup)
+
+                    const userPermissions = this.getEffectivePermissions(objectType.name, user.groups, existingObj.groups);
 
                     let data: Buffer<ArrayBuffer> | undefined = undefined;
                     let nonce: Buffer<ArrayBuffer> | undefined = undefined;
@@ -680,6 +903,144 @@ class SafeServer {
 
                 break;
             }
+
+            case "upsert-table": {
+                const columns = (await this.prisma.$queryRaw`SELECT column_name, data_type, is_nullable, column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = ${"public"}
+                    AND table_name = ${msg.tableName}
+                    ORDER BY ordinal_position;`) as { column_name: string; data_type: string; is_nullable: string; column_default: string }[];
+
+                const tableName = msg.tableName;
+                const groupTableName = tableName + "_Group";
+
+                // console.log("existing columns", columns);
+                // const newColumns = msg.description.filter((e) => !columns.some((f) => f.column_name !== e.name));
+                // const removedColumns = columns.filter((e) => !msg.description.some((f) => e.column_name !== f.name));
+
+                const transaction = [] as PrismaPromise<any>[];
+                transaction.push(
+                    this.prisma.$queryRawUnsafe(
+                        `CREATE TABLE IF NOT EXISTS "${tableName}"(
+                            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                            CONSTRAINT ${tableName}_pkey PRIMARY KEY (id)
+                        );
+                    `
+                    )
+                );
+                transaction.push(
+                    this.prisma.$queryRawUnsafe(`
+                        CREATE TABLE IF NOT EXISTS "${groupTableName}"(
+                            group_id TEXT NOT NULL,
+                            object_id BIGINT NOT NULL,
+
+                            CONSTRAINT ${groupTableName}_pkey 
+                                PRIMARY KEY (group_id, object_id),
+
+                            CONSTRAINT ${groupTableName}_group_fk
+                                FOREIGN KEY (group_id)
+                                REFERENCES "Group"(id)
+                                ON DELETE CASCADE,
+
+                            CONSTRAINT ${groupTableName}_object_fk
+                                FOREIGN KEY (object_id)
+                                REFERENCES "${tableName}"(id)
+                                ON DELETE CASCADE
+                        );
+                    `)
+                );
+
+                for (const col of msg.description) {
+                    const colType = col.encrypted ? "BYTEA" : col.type;
+                    const keyColumnName = col.name + "_key";
+
+                    if (!columns.some((f) => f.column_name !== col.name)) {
+                        // New column
+                        transaction.push(this.prisma.$queryRawUnsafe(`ALTER TABLE "${tableName}" ADD COLUMN "${col.name}" ${colType}`));
+                        if (col.encrypted) {
+                            transaction.push(this.prisma.$queryRawUnsafe(`ALTER TABLE "${groupTableName}" ADD COLUMN "${keyColumnName}" BYTEA`));
+                        }
+                    } else {
+                        // Existing column
+                        transaction.push(this.prisma.$queryRawUnsafe(`ALTER TABLE "${tableName}" ALTER COLUMN "${col.name}" TYPE ${colType}`));
+                    }
+                }
+
+                for (const col of columns) {
+                    const keyColumnName = col.column_name + "_key";
+                    if (!msg.description.some((f) => col.column_name !== f.name)) {
+                        // Removed column
+                        transaction.push(this.prisma.$queryRawUnsafe(`ALTER TABLE "${tableName}" DROP COLUMN IF EXISTS "${col.column_name}"`));
+                        transaction.push(this.prisma.$queryRawUnsafe(`ALTER TABLE "${groupTableName}" DROP COLUMN IF EXISTS "${keyColumnName}"`));
+                    }
+                }
+
+                transaction.push(
+                    this.prisma.tableDescriptor.update({
+                        where: {
+                            tableName: msg.tableName,
+                        },
+                        data: {
+                            description: msg.description,
+                        },
+                    })
+                );
+
+                await this.prisma.$transaction(transaction);
+
+                wsUser.send({
+                    type: "upsert-table-response",
+                    request: msg.request,
+                });
+
+                break;
+            }
+
+            case "create-group": {
+                const group = await this.prisma.$transaction(async (prisma) => {
+                    const group = await prisma.group.create({
+                        data: {
+                            name: msg.groupName,
+                            publicKey: Buffer.from(msg.publicKeyBase64, "base64"),
+                        },
+                        select: {
+                            id: true,
+                        },
+                    });
+
+                    await prisma.groupPolicy.createMany({
+                        data: msg.policies.map((e) => ({
+                            groupId: group.id,
+                            otherGroupId: e.otherGroupId ?? group.id,
+                            tableName: e.tableName,
+                            allowAdd: e.allowAdd ?? false,
+                            allowRemove: e.allowRemove ?? false,
+                            allowRead: e.allowRead ?? false,
+                            allowReadWrite: e.allowReadWrite ?? false,
+                            readFields: e.readFields ?? [], // default: empty means all
+                            writeFields: e.writeFields ?? [], // default: empty means all
+                        })),
+                    });
+
+                    return group;
+                });
+
+                wsUser.send({
+                    type: "create-group-response",
+                    request: msg.request,
+                    groupId: group.id,
+                });
+
+                break;
+            }
+
+            // case "update-group": {
+            //     await this.prisma.groupPolicy.up({
+            //         where: {},
+            //     });
+
+            //     break;
+            // }
 
             case "query": {
                 if (!user) {
@@ -1526,15 +1887,15 @@ async function main() {
 
     await client.login("stijn", "Vrijdag1@");
 
-    await client.update("User", 1, {
-        private: {
-            age: 24,
-            name: "sr",
-        },
-        public: {
-            email: "stijnvantvijfde@gmail.com",
-        },
-    });
+    // await client.update("User", 1, {
+    //     private: {
+    //         age: 24,
+    //         name: "sr",
+    //     },
+    //     public: {
+    //         email: "stijnvantvijfde@gmail.com",
+    //     },
+    // });
 
     const user = await client.get("User", 1);
     console.log("obj", user);

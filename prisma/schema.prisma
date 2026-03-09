@@ -47,13 +47,10 @@ model User {
 }
 
 model GroupUserPermission {
-  userId      String
-  user        User    @relation(fields: [userId], references: [id])
-  groupId     String
-  group       Group   @relation(fields: [groupId], references: [id])
-  allowRead   Boolean @default(true)
-  allowWrite  Boolean @default(true)
-  allowCreate Boolean @default(true)
+  userId  String
+  user    User   @relation(fields: [userId], references: [id])
+  groupId String
+  group   Group  @relation(fields: [groupId], references: [id])
 
   encryptedGroupPrivateKey Bytes // Encrypted using User public key
   // encryptedGroupPrivateKeyNonce Bytes 
@@ -66,11 +63,42 @@ model Group {
 
   selfUser User? @relation(name: "SelfGroupUser")
 
+  name      String
   publicKey Bytes
   // privateKey: stored in GroupUserPermission
 
-  users   GroupUserPermission[]
-  objects ObjectGroupPermission[]
+  users         GroupUserPermission[]
+  objects       ObjectGroupPermission[]
+  policies      GroupPolicy[]           @relation("policies")
+  otherPolicies GroupPolicy[]           @relation("otherPolicies")
+}
+
+// "PublicMayEditRegistration" "PublicMayCreate"
+// "PublicMayReadRegistrations" 
+
+model GroupPolicy {
+  groupId      String
+  group        Group           @relation(fields: [groupId], references: [id], name: "policies")
+  otherGroupId String
+  otherGroup   Group           @relation(fields: [otherGroupId], references: [id], name: "otherPolicies")
+  tableName    String
+  table        TableDescriptor @relation(fields: [tableName], references: [tableName])
+
+  allowReadWrite Boolean
+  writeFields    String[]
+  allowRead      Boolean
+  readFields     String[]
+  allowRemove    Boolean // deleting or unsharing object from group
+  allowAdd       Boolean // adding or sharing object with group
+
+  @@id([groupId, otherGroupId, tableName])
+}
+
+model TableDescriptor {
+  tableName   String @id @unique
+  description Json
+
+  tableBeliefs GroupPolicy[]
 }
 
 model ObjectGroupPermission {
@@ -81,6 +109,7 @@ model ObjectGroupPermission {
 
   encryptedObjectKey Bytes // Encrypted using Group public key
   // encryptedObjectKeyNonce Bytes
+  // encryptedColumnKeys Json // Encrypted
 
   @@id([groupId, objectId])
 }
