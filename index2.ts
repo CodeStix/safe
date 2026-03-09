@@ -2,7 +2,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import AsyncLock from "async-lock";
 import "dotenv/config";
 import { IncomingMessage } from "http";
-import sodium from "libsodium-wrappers-sumo";
+import sodium, { crypto_box_curve25519xchacha20poly1305_keypair } from "libsodium-wrappers-sumo";
 import { RawData, WebSocket, WebSocketServer } from "ws";
 import * as z from "zod";
 import { Group, PrismaClient } from "./prisma/prisma/client";
@@ -53,6 +53,20 @@ type ServerMessage =
           //   encryptedObjectKeyNonceBase64: string;
       }
     | {
+          type: "create-collection";
+          name: string;
+          publicKeyBase64: string;
+          selfEncryptedPrivateKeyBase64: string;
+      }
+    | {
+          type: "get-collection";
+          id: string;
+      }
+    | {
+          type: "get-collections";
+          name: string;
+      }
+    | {
           type: "update";
           id: number;
           tableName: string;
@@ -64,6 +78,7 @@ type ServerMessage =
           type: "get";
           id: number;
           tableName: string;
+          collectionId: string;
       }
     | {
           type: "query";
@@ -127,6 +142,33 @@ type ClientMessage =
     //       type: "auth-response";
     //       request: number;
     //   }
+    | {
+          type: "create-collection-response";
+          request: number;
+          collectionId: string;
+      }
+    | {
+          type: "get-collections-response";
+          request: number;
+          collections: {
+              id: string;
+              name: string;
+              encryptedPrivateKeyBase64: string;
+              publicKeyBase64: string;
+              groupId: string;
+          }[];
+      }
+    | {
+          type: "get-collection-response";
+          request: number;
+          collection: {
+              id: string;
+              name: string;
+              encryptedPrivateKeyBase64: string;
+              publicKeyBase64: string;
+              groupId: string;
+          } | null;
+      }
     | {
           type: "register-response";
           request: number;
@@ -580,31 +622,32 @@ class SafeServer {
                     break;
                 }
 
-                const objectType = this.getType(msg.tableName);
-                if (!objectType) {
-                    wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
-                    break;
-                }
+                // const objectType = this.getType(msg.tableName);
+                // if (!objectType) {
+                //     wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
+                //     break;
+                // }
 
                 const data = Buffer.from(msg.dataBase64, "base64");
                 const nonce = Buffer.from(msg.nonceBase64, "base64");
 
-                if (nonce.length !== 8 || data.length > objectType.privateDataMaxSize) {
+                const privateDataMaxSize = 1000; // TODO
+                if (nonce.length !== 8 || data.length > privateDataMaxSize) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Invalid private data" });
                     break;
                 }
 
                 let publicData: any | undefined = undefined;
 
-                if (typeof msg.publicData !== "undefined") {
-                    try {
-                        publicData = objectType.publicDataValidator(msg.publicData);
-                    } catch (ex) {
-                        console.error("Could not validate public data", ex);
-                        wsUser.send({ type: "error-response", request: msg.request, message: "Invalid public data" });
-                        break;
-                    }
-                }
+                // if (typeof msg.publicData !== "undefined") {
+                //     try {
+                //         publicData = objectType.publicDataValidator(msg.publicData);
+                //     } catch (ex) {
+                //         console.error("Could not validate public data", ex);
+                //         wsUser.send({ type: "error-response", request: msg.request, message: "Invalid public data" });
+                //         break;
+                //     }
+                // }
 
                 const userRights = await this.prisma.groupCollection.findFirst({
                     where: {
@@ -633,7 +676,7 @@ class SafeServer {
 
                 const obj = await this.prisma.object.create({
                     data: {
-                        tableName: objectType.name,
+                        tableName: msg.tableName,
                         data: data,
                         nonce: nonce,
                         publicData: publicData,
@@ -775,6 +818,167 @@ class SafeServer {
                     });
 
                     return;
+                });
+
+                break;
+            }
+
+            case "create-collection": {
+                if (!user) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
+                    break;
+                }
+
+                const publicKey = Buffer.from(msg.publicKeyBase64, "base64");
+                const encryptedPrivateKey = Buffer.from(msg.selfEncryptedPrivateKeyBase64, "base64");
+
+                const collection = await this.prisma.collection.create({
+                    data: {
+                        publicKey: publicKey,
+                        name: msg.name,
+                        groups: {
+                            create: {
+                                groupId: user.selfGroupId,
+                                encryptedCollectionPrivateKey: encryptedPrivateKey,
+                                canAdd: true,
+                                canQuery: true,
+                                canRead: true,
+                                canRemove: true,
+                                canWrite: true,
+                                readFields: [],
+                                writeFields: [],
+                            },
+                        },
+                    },
+                    select: {
+                        id: true,
+                    },
+                });
+
+                wsUser.send({
+                    type: "create-collection-response",
+                    request: msg.request,
+                    collectionId: collection.id,
+                });
+
+                break;
+            }
+
+            case "get-collection": {
+                if (!user) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
+                    break;
+                }
+
+                const collection = await this.prisma.collection.findUnique({
+                    where: {
+                        id: msg.id,
+                        groups: {
+                            some: {
+                                group: {
+                                    users: {
+                                        some: {
+                                            userId: user.id,
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    select: {
+                        id: true,
+                        name: true,
+                        publicKey: true,
+                        groups: {
+                            take: 1,
+                            where: {
+                                group: {
+                                    users: {
+                                        some: {
+                                            userId: user.id,
+                                        },
+                                    },
+                                },
+                            },
+                            select: {
+                                encryptedCollectionPrivateKey: true,
+                                groupId: true,
+                            },
+                        },
+                    },
+                });
+
+                wsUser.send({
+                    type: "get-collection-response",
+                    request: msg.request,
+                    collection: collection
+                        ? {
+                              id: collection.id,
+                              name: collection.name,
+                              publicKeyBase64: Buffer.from(collection.publicKey).toString("base64"),
+                              encryptedPrivateKeyBase64: Buffer.from(collection.groups[0]!.encryptedCollectionPrivateKey).toString("base64"),
+                              groupId: collection.groups[0]!.groupId,
+                          }
+                        : null,
+                });
+
+                break;
+            }
+
+            case "get-collections": {
+                if (!user) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
+                    break;
+                }
+
+                const collections = await this.prisma.collection.findMany({
+                    where: {
+                        name: msg.name,
+                        groups: {
+                            some: {
+                                group: {
+                                    users: {
+                                        some: {
+                                            userId: user.id,
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    select: {
+                        id: true,
+                        name: true,
+                        publicKey: true,
+                        groups: {
+                            take: 1,
+                            where: {
+                                group: {
+                                    users: {
+                                        some: {
+                                            userId: user.id,
+                                        },
+                                    },
+                                },
+                            },
+                            select: {
+                                encryptedCollectionPrivateKey: true,
+                                groupId: true,
+                            },
+                        },
+                    },
+                });
+
+                wsUser.send({
+                    type: "get-collections-response",
+                    request: msg.request,
+                    collections: collections.map((e) => ({
+                        id: e.id,
+                        name: e.name,
+                        publicKeyBase64: Buffer.from(e.publicKey).toString("base64"),
+                        encryptedPrivateKeyBase64: Buffer.from(e.groups[0]!.encryptedCollectionPrivateKey).toString("base64"),
+                        groupId: e.groups[0]!.groupId,
+                    })),
                 });
 
                 break;
@@ -1049,13 +1253,14 @@ class SafeServer {
 
                 const userRights = await this.prisma.groupCollection.findMany({
                     where: {
-                        collection: {
-                            objects: {
-                                some: {
-                                    objectId: msg.id,
-                                },
-                            },
-                        },
+                        // collection: {
+                        //     objects: {
+                        //         some: {
+                        //             objectId: msg.id,
+                        //         },
+                        //     },
+                        // },
+                        collectionId: msg.collectionId,
                         group: {
                             users: {
                                 some: {
@@ -1451,46 +1656,6 @@ class SafeClient<T extends Record<string, ObjectType>> {
         return res;
     }
 
-    async createRaw(typeName: string, privateData: Uint8Array, publicData: any | undefined): Promise<number> {
-        await sodium.ready;
-
-        const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
-        const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
-
-        const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(privateData, null, null, nonce, key);
-
-        console.log("Encrypt", privateData.length, "->", cipher.length);
-
-        console.log("Create key size", key.length, "nonce size", nonce.length, "nonce", nonceToInt(nonce));
-
-        const selfGroup = this.getSelfGroup();
-        if (!selfGroup) {
-            throw new Error("No self group");
-        }
-
-        const encryptedObjectKey = sodium.crypto_box_seal(key, selfGroup.publicKey);
-
-        const res = await this.request({
-            type: "insert",
-            tableName: typeName,
-            dataBase64: encodeBase64(cipher),
-            nonceBase64: encodeBase64(nonce),
-            publicData: publicData,
-            encryptedObjectKeyBase64: encodeBase64(encryptedObjectKey),
-            groupId: selfGroup.id,
-        });
-        if (res.type !== "insert-response") {
-            throw new Error();
-        }
-
-        // await this.storeKey(res.id, {
-        //     key: key,
-        //     nonce: nonce,
-        // });
-
-        return res.id;
-    }
-
     // async getKey(id: number): Promise<StoredKey | undefined> {
     //     return this.keyPerId.get(id);
     // }
@@ -1499,89 +1664,77 @@ class SafeClient<T extends Record<string, ObjectType>> {
     //     this.keyPerId.set(id, key);
     // }
 
-    async updateRaw(type: string, id: number, privateData: Uint8Array | undefined, publicData: any | undefined) {
-        if (typeof privateData === "undefined") {
-            if (typeof publicData === "undefined") {
-                throw new Error("updateRaw must specify privateData or publicData");
-            }
+    async getCollection(id: string) {
+        const res = await this.request({
+            type: "get-collection",
+            id: id,
+        });
+        if (res.type !== "get-collection-response") throw new Error();
 
-            await this.request({
-                type: "update",
-                tableName: type,
-                publicData: publicData,
-                id: id,
-            });
-            return;
+        if (!res.collection) {
+            return null;
         }
 
-        await sodium.ready;
-
-        // const key = await this.getKey(id);
-        // if (!key) {
-        //     throw new Error("Cannot update, no key");
-        // }
-
-        const getResponse = await this.request({ type: "get", objectType: type, id: id });
-        if (getResponse.type !== "get-response") throw new Error();
-
-        if (!getResponse.collectionId || !getResponse.encryptedObjectKeyBase64 || !getResponse.nonceBase64) {
-            throw new Error("Object to update not found");
-        }
-
-        const group = this.getLocalGroup(getResponse.collectionId);
+        const group = this.getLocalGroup(res.collection.groupId);
         if (!group) {
-            throw new Error("No object");
+            throw new Error("Local group not found: " + res.collection.groupId);
         }
 
-        const key = sodium.crypto_box_seal_open(decodeBase64(getResponse.encryptedObjectKeyBase64), group.publicKey, group.privateKey);
-        const nonce = nonceToInt(decodeBase64(getResponse.nonceBase64));
-
-        let newNonce = intToNonce(increment64(nonce, 1n));
-        // let newKey = rotateKey(key, 1);
-
-        while (true) {
-            const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(privateData, null, null, newNonce, key);
-
-            console.log("Encrypt", privateData.length, "->", cipher.length);
-
-            const res = await this.request({
-                type: "update",
-                tableName: type,
-                dataBase64: encodeBase64(cipher),
-                nonceBase64: encodeBase64(newNonce),
-                publicData: publicData,
-                id: id,
-            });
-
-            if (res.type === "update-invalid-version") {
-                const serverNonce = nonceToInt(decodeBase64(res.nonceBase64));
-
-                // const keyRotateCount = difference64(serverNonce, nonce);
-                // if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
-                //     throw new Error("Client has newer key than server, shouldn't be possible");
-                // }
-
-                // console.log("Rotate key", keyRotateCount, "times in updateRaw", nonce, serverNonce);
-
-                newNonce = intToNonce(increment64(serverNonce, 1n));
-                // newKey = rotateKey(newKey, Number(keyRotateCount));
-            } else if (res.type === "update-response") {
-                // await this.storeKey(id, {
-                //     key: newKey,
-                //     nonce: newNonce,
-                // });
-                break;
-            } else {
-                throw new Error();
-            }
-        }
+        const publicKey = decodeBase64(res.collection.publicKeyBase64);
+        const encryptedPrivateKeyBase64 = decodeBase64(res.collection.encryptedPrivateKeyBase64);
+        const privateKey = sodium.crypto_box_seal_open(encryptedPrivateKeyBase64, group.publicKey, group.privateKey);
+        return new Collection(this, res.collection.id, publicKey, privateKey);
     }
 
-    async queryRaw(type: string, publicQuery: Record<string, any>) {
-        const res = await this.request({ type: "query", objectType: type, query: publicQuery });
-        if (res.type !== "query-response") {
-            throw new Error();
+    async getCollections(name: string) {
+        const res = await this.request({
+            type: "get-collections",
+            name: name,
+        });
+        if (res.type !== "get-collections-response") throw new Error();
+
+        return res.collections.map((e) => {
+            const group = this.getLocalGroup(e.groupId);
+            if (!group) {
+                throw new Error("Local group not found: " + e.groupId);
+            }
+
+            const publicKey = decodeBase64(e.publicKeyBase64);
+            const encryptedPrivateKeyBase64 = decodeBase64(e.encryptedPrivateKeyBase64);
+            const privateKey = sodium.crypto_box_seal_open(encryptedPrivateKeyBase64, group.publicKey, group.privateKey);
+            return new Collection(this, e.id, publicKey, privateKey);
+        });
+    }
+
+    async createCollection(name: string) {
+        await sodium.ready;
+
+        const selfGroup = this.getSelfGroup();
+        if (!selfGroup) {
+            throw new Error("selfGroup == null");
         }
+
+        const collectionKeypair = sodium.crypto_box_keypair();
+        const encryptedCollectionPrivateKey = sodium.crypto_box_seal(collectionKeypair.privateKey, selfGroup.publicKey);
+
+        const res = await this.request({
+            type: "create-collection",
+            name: name,
+            publicKeyBase64: encodeBase64(collectionKeypair.publicKey),
+            selfEncryptedPrivateKeyBase64: encodeBase64(encryptedCollectionPrivateKey),
+        });
+
+        if (res.type !== "create-collection-response") throw new Error();
+
+        return new Collection(this, res.collectionId, collectionKeypair.publicKey, collectionKeypair.privateKey);
+    }
+
+    async getOrCreateCollection(name: string) {
+        const collections = await this.getCollections(name);
+        if (collections.length > 0) {
+            return collections[0]!;
+        }
+        return await this.createCollection(name);
     }
 
     getLocalGroup(id: string) {
@@ -1595,7 +1748,140 @@ class SafeClient<T extends Record<string, ObjectType>> {
         return this.getLocalGroup(this.selfGroupId);
     }
 
-    async getRaw(type: string, id: number) {
+    // async query<K extends keyof T & string>(type: K, query: SafeDataQuery<T[K]>): Promise<GetSafeData<T[K]>[]> {}
+
+    handleMessage(data: RawData, isBinary: boolean) {
+        console.log("<====", data.toString("utf-8"));
+
+        const message = JSON.parse(data.toString()) as ClientMessage;
+        if ("request" in message) {
+            // Request response
+            const handler = this.responseHandlers.get(message.request);
+            if (handler) {
+                this.responseHandlers.delete(message.request);
+                handler(message);
+            } else {
+                console.error("Unknown request response", message);
+            }
+        } else {
+            console.log("Unhandled client message", message);
+        }
+    }
+
+    // handleOpen()
+}
+
+class Collection {
+    readonly client: SafeClient<any>;
+    readonly id: string;
+
+    #publicKey: Uint8Array;
+    #privateKey: Uint8Array;
+
+    constructor(client: SafeClient<any>, id: string, publicKey: Uint8Array, privateKey: Uint8Array) {
+        this.client = client;
+        this.id = id;
+        this.#privateKey = privateKey;
+        this.#publicKey = publicKey;
+    }
+
+    async create<K extends string>(tableName: K, data: { private: any; public: any }) {
+        // const objectType = this.getType(type);
+        // if (!objectType) {
+        //     throw new Error("Unknown type " + type);
+        // }
+
+        // let privateData: any;
+        // try {
+        //     privateData = objectType.privateDataValidator(data.private);
+        // } catch (ex) {
+        //     throw new Error("Could not validate private data: " + String(ex));
+        // }
+
+        // let publicData: any | undefined = undefined;
+        // if (typeof data.public !== "undefined") {
+        //     try {
+        //         publicData = objectType.publicDataValidator(data.public);
+        //     } catch (ex) {
+        //         throw new Error("Could not validate public data: " + String(ex));
+        //     }
+        // }
+
+        return await this.createRaw(tableName, new TextEncoder().encode(JSON.stringify(data.private)), data.public);
+    }
+
+    async createRaw(tableName: string, privateData: Uint8Array, publicData: any | undefined): Promise<number> {
+        await sodium.ready;
+
+        const key = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_KEYBYTES);
+        const nonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
+
+        const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(privateData, null, null, nonce, key);
+
+        console.log("Encrypt", privateData.length, "->", cipher.length);
+
+        console.log("Create key size", key.length, "nonce size", nonce.length, "nonce", nonceToInt(nonce));
+
+        // const selfGroup = this.getSelfGroup();
+        // if (!selfGroup) {
+        //     throw new Error("No self group");
+        // }
+
+        const encryptedObjectKey = sodium.crypto_box_seal(key, this.#publicKey);
+
+        const res = await this.client.request({
+            type: "insert",
+            tableName: tableName,
+            dataBase64: encodeBase64(cipher),
+            nonceBase64: encodeBase64(nonce),
+            publicData: publicData,
+            encryptedObjectKeyBase64: encodeBase64(encryptedObjectKey),
+            collectionId: this.id,
+            // groupId: selfGroup.id,
+        });
+        if (res.type !== "insert-response") {
+            throw new Error();
+        }
+
+        // await this.storeKey(res.id, {
+        //     key: key,
+        //     nonce: nonce,
+        // });
+
+        return res.id;
+    }
+
+    async get<Pub, Priv>(tableName: string, id: number): Promise<{ public: Pub; private: Priv } | null> {
+        // const objectType = this.getType(type);
+        // if (!objectType) {
+        //     throw new Error("Unknown type " + type);
+        // }
+
+        const objData = await this.getRaw(tableName, id);
+        if (!objData) {
+            return null;
+        }
+
+        let privateData = JSON.parse(new TextDecoder().decode(objData.private));
+
+        // try {
+        //     privateData = objectType.privateDataValidator(privateData);
+        // } catch (ex) {
+        //     throw new Error("Could not validate private data: " + String(ex));
+        // }
+
+        // // Make sure to validate public data (actually only done to run transformers)
+        // let publicData = objData.public;
+        // try {
+        //     publicData = objectType.publicDataValidator(publicData);
+        // } catch (ex) {
+        //     throw new Error("Could not validate public data: " + String(ex));
+        // }
+
+        return { private: privateData, public: objData.public } as { public: Pub; private: Priv };
+    }
+
+    async getRaw(tableName: string, id: number) {
         await sodium.ready;
 
         // const key = await this.getKey(id);
@@ -1603,7 +1889,12 @@ class SafeClient<T extends Record<string, ObjectType>> {
         //     throw new Error("No key for " + id);
         // }
 
-        const res = await this.request({ type: "get", objectType: type, id: id });
+        const res = await this.client.request({
+            type: "get",
+            tableName: tableName,
+            id: id,
+            collectionId: this.id,
+        });
         if (res.type !== "get-response") {
             throw new Error();
         }
@@ -1612,12 +1903,16 @@ class SafeClient<T extends Record<string, ObjectType>> {
             const cipher = decodeBase64(res.dataBase64);
             const nonce = decodeBase64(res.nonceBase64);
 
-            const group = this.getLocalGroup(res.collectionId);
-            if (!group) {
-                throw new Error("No local group");
+            // const group = this.getLocalGroup(res.collectionId);
+            // if (!group) {
+            //     throw new Error("No local group");
+            // }
+
+            if (res.collectionId !== this.id) {
+                throw new Error("Cannot decrypt: res.collectionId !== this.id");
             }
 
-            let ciperKey = sodium.crypto_box_seal_open(decodeBase64(res.encryptedObjectKeyBase64), group.publicKey, group.privateKey);
+            let ciperKey = sodium.crypto_box_seal_open(decodeBase64(res.encryptedObjectKeyBase64), this.#publicKey, this.#privateKey);
 
             // let ciperKey = key.key;
 
@@ -1648,109 +1943,122 @@ class SafeClient<T extends Record<string, ObjectType>> {
         }
     }
 
-    async get<K extends keyof T & string>(type: K, id: number): Promise<GetSafeData<T[K]> | null> {
-        const objectType = this.getType(type);
-        if (!objectType) {
-            throw new Error("Unknown type " + type);
-        }
+    async update(tableName: string, id: number, data: { public: any; private: any }) {
+        // const objectType = this.getType(type);
+        // if (!objectType) {
+        //     throw new Error("Unknown type " + type);
+        // }
 
-        const objData = await this.getRaw(type, id);
-        if (!objData) {
-            return null;
-        }
+        // let privateData: any | undefined = undefined;
+        // if (typeof data.private !== "undefined") {
+        //     try {
+        //         privateData = objectType.privateDataValidator(data.private);
+        //     } catch (ex) {
+        //         throw new Error("Could not validate private data: " + String(ex));
+        //     }
+        // }
 
-        let privateData = JSON.parse(new TextDecoder().decode(objData.private));
+        // let publicData: any | undefined = undefined;
+        // if (typeof data.public !== "undefined") {
+        //     try {
+        //         publicData = objectType.publicDataValidator(data.public);
+        //     } catch (ex) {
+        //         throw new Error("Could not validate public data: " + String(ex));
+        //     }
+        // }
 
-        try {
-            privateData = objectType.privateDataValidator(privateData);
-        } catch (ex) {
-            throw new Error("Could not validate private data: " + String(ex));
-        }
-
-        // Make sure to validate public data (actually only done to run transformers)
-        let publicData = objData.public;
-        try {
-            publicData = objectType.publicDataValidator(publicData);
-        } catch (ex) {
-            throw new Error("Could not validate public data: " + String(ex));
-        }
-
-        return { private: privateData, public: publicData } as GetSafeData<T[K]>;
+        await this.updateRaw(
+            tableName,
+            id,
+            data.private === undefined ? undefined : new TextEncoder().encode(JSON.stringify(data.private)),
+            data.public
+        );
     }
 
-    // async query<K extends keyof T & string>(type: K, query: SafeDataQuery<T[K]>): Promise<GetSafeData<T[K]>[]> {}
-
-    async create<K extends keyof T & string>(type: K, data: GetSafeData<T[K]>) {
-        const objectType = this.getType(type);
-        if (!objectType) {
-            throw new Error("Unknown type " + type);
-        }
-
-        let privateData: any;
-        try {
-            privateData = objectType.privateDataValidator(data.private);
-        } catch (ex) {
-            throw new Error("Could not validate private data: " + String(ex));
-        }
-
-        let publicData: any | undefined = undefined;
-        if (typeof data.public !== "undefined") {
-            try {
-                publicData = objectType.publicDataValidator(data.public);
-            } catch (ex) {
-                throw new Error("Could not validate public data: " + String(ex));
+    async updateRaw(tableName: string, id: number, privateData: Uint8Array | undefined, publicData: any | undefined) {
+        if (typeof privateData === "undefined") {
+            if (typeof publicData === "undefined") {
+                throw new Error("updateRaw must specify privateData or publicData");
             }
+
+            await this.client.request({
+                type: "update",
+                tableName: tableName,
+                publicData: publicData,
+                id: id,
+            });
+            return;
         }
 
-        return await this.createRaw(type, new TextEncoder().encode(JSON.stringify(privateData)), publicData);
-    }
+        await sodium.ready;
 
-    async update<K extends keyof T & string>(type: K, id: number, data: Partial<GetSafeData<T[K]>>) {
-        const objectType = this.getType(type);
-        if (!objectType) {
-            throw new Error("Unknown type " + type);
+        // const key = await this.getKey(id);
+        // if (!key) {
+        //     throw new Error("Cannot update, no key");
+        // }
+
+        const getResponse = await this.client.request({ type: "get", tableName: tableName, id: id, collectionId: this.id });
+        if (getResponse.type !== "get-response") throw new Error();
+
+        if (!getResponse.collectionId || !getResponse.encryptedObjectKeyBase64 || !getResponse.nonceBase64) {
+            throw new Error("Object to update not found");
         }
 
-        let privateData: any | undefined = undefined;
-        if (typeof data.private !== "undefined") {
-            try {
-                privateData = objectType.privateDataValidator(data.private);
-            } catch (ex) {
-                throw new Error("Could not validate private data: " + String(ex));
-            }
-        }
+        // const group = this.getLocalGroup(getResponse.collectionId);
+        // if (!group) {
+        //     throw new Error("No object");
+        // }
 
-        let publicData: any | undefined = undefined;
-        if (typeof data.public !== "undefined") {
-            try {
-                publicData = objectType.publicDataValidator(data.public);
-            } catch (ex) {
-                throw new Error("Could not validate public data: " + String(ex));
-            }
-        }
+        const key = sodium.crypto_box_seal_open(decodeBase64(getResponse.encryptedObjectKeyBase64), this.#publicKey, this.#privateKey);
+        const nonce = nonceToInt(decodeBase64(getResponse.nonceBase64));
 
-        await this.updateRaw(type, id, privateData === undefined ? undefined : new TextEncoder().encode(JSON.stringify(privateData)), publicData);
-    }
+        let newNonce = intToNonce(increment64(nonce, 1n));
+        // let newKey = rotateKey(key, 1);
 
-    handleMessage(data: RawData, isBinary: boolean) {
-        console.log("<====", data.toString("utf-8"));
+        while (true) {
+            const cipher = sodium.crypto_aead_chacha20poly1305_encrypt(privateData, null, null, newNonce, key);
 
-        const message = JSON.parse(data.toString()) as ClientMessage;
-        if ("request" in message) {
-            // Request response
-            const handler = this.responseHandlers.get(message.request);
-            if (handler) {
-                this.responseHandlers.delete(message.request);
-                handler(message);
+            console.log("Encrypt", privateData.length, "->", cipher.length);
+
+            const res = await this.client.request({
+                type: "update",
+                tableName: tableName,
+                dataBase64: encodeBase64(cipher),
+                nonceBase64: encodeBase64(newNonce),
+                publicData: publicData,
+                id: id,
+            });
+
+            if (res.type === "update-invalid-version") {
+                const serverNonce = nonceToInt(decodeBase64(res.nonceBase64));
+
+                // const keyRotateCount = difference64(serverNonce, nonce);
+                // if (keyRotateCount > Number.MAX_SAFE_INTEGER) {
+                //     throw new Error("Client has newer key than server, shouldn't be possible");
+                // }
+
+                // console.log("Rotate key", keyRotateCount, "times in updateRaw", nonce, serverNonce);
+
+                newNonce = intToNonce(increment64(serverNonce, 1n));
+                // newKey = rotateKey(newKey, Number(keyRotateCount));
+            } else if (res.type === "update-response") {
+                // await this.storeKey(id, {
+                //     key: newKey,
+                //     nonce: newNonce,
+                // });
+                break;
             } else {
-                console.error("Unknown request response", message);
+                throw new Error();
             }
-        } else {
-            console.log("Unhandled client message", message);
         }
     }
 
-    // handleOpen()
+    // async queryRaw(type: string, publicQuery: Record<string, any>) {
+    //     const res = await this.request({ type: "query", objectType: type, query: publicQuery });
+    //     if (res.type !== "query-response") {
+    //         throw new Error();
+    //     }
+    // }
 }
 
 function zodToType<K extends string, Schema extends z.ZodObject<{ public: z.ZodType; private: z.ZodType }>>(
@@ -1788,85 +2096,38 @@ async function main() {
     const settings = new SafeSettings().withType(zodToType("User", User)).withType(zodToType("Profile", Profile));
 
     const server = new SafeServer(settings);
-    // server.registerType(zodToType("User", User));
-
-    // User.
-
-    // let a: z.input<typeof Person>["name"]
 
     const client = new SafeClient("ws://localhost:8080", settings);
 
     await client.login("stijn", "Vrijdag1@");
 
-    // await client.update("User", 1, {
-    //     private: {
-    //         age: 24,
-    //         name: "sr",
-    //     },
-    //     public: {
-    //         email: "stijnvantvijfde@gmail.com",
-    //     },
-    // });
+    const col = await client.getOrCreateCollection("user");
 
-    const user = await client.get("User", 1);
-    console.log("obj", user);
-
-    // await client.create("User", {
-    //     private: {
-    //         name: "stijn",
-    //         age: 25,
-    //     },
-    //     public: {
-    //         email: "reddusted@gmail.com",
-    //     },
-    // });
-    // await client.login("stijn2", "Vrijdag1@");
-
-    return;
-
-    // client.create("Profile", {
-    //     private: {
-    //         imageUrl: "",
-    //     },
-    //     public: null,
-    // });
-    // client.registerType(zodToType("User", User));
-
-    // await client.authenticate("reddusted@gmail.com");
-    // await client.register()
-
-    // const users = await client.query("User", {
-    //     public: {
-    //         email: "",
-    //     },
-    // });
-
-    let id = await client.create("User", {
-        private: {
-            name: "Stijn Rogiest",
-            age: 25,
-        },
-        public: {
-            email: "reddusted@gmail.com",
-        },
-    });
-
-    let obj = await client.get("User", id);
-    // console.log("obj", obj);
-
-    await client.update("User", id, {
-        private: { name: obj!.private.name + "!!!!", age: obj!.private.age + 1 },
-        public: { email: "reddusted200@gmail.com" },
-    });
-
-    // obj = await client.get("User", id);
-
-    await client.update("User", id, {
-        private: {
-            name: obj!.private.name + "!!!!",
-            age: obj!.private.age + 1,
-        },
-    });
+    const profile = await col.get<{ note: string }, { name: string; email: string; age: number }>("Profile", 3);
+    if (!profile) {
+        const id = await col.create("Profile", {
+            private: {
+                name: "stijn rogiest",
+                email: "reddusted@gmail.com",
+                age: 25,
+            },
+            public: {
+                note: "oof",
+            },
+        });
+        console.log("created profile with id", id);
+    } else {
+        console.log("profile", profile);
+        col.update("Profile", 3, {
+            private: {
+                ...profile.private,
+                age: profile.private.age + 1,
+            },
+            public: {
+                note: "updated",
+            },
+        });
+    }
 }
 
 main();
