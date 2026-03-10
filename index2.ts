@@ -7,6 +7,7 @@ import { RawData, WebSocket, WebSocketServer } from "ws";
 import * as z from "zod";
 import { Group, PrismaClient } from "./prisma/prisma/client";
 import { PrismaPromise } from "@prisma/client/runtime/client";
+import util from "util";
 
 // type ObjectTypeName = string;
 
@@ -65,6 +66,7 @@ type ServerMessage =
     | {
           type: "get-collections";
           name: string;
+          inGroupId?: string;
       }
     | {
           type: "update";
@@ -1500,7 +1502,7 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
     send(message: ServerMessage) {
         if (this.socket.readyState === WebSocket.OPEN) {
-            console.log("====>", JSON.stringify(message));
+            console.log("====>", util.inspect(message, { colors: true, breakLength: Number.POSITIVE_INFINITY }));
             this.socket.send(JSON.stringify(message));
         } else {
             this.socket.once("open", () => this.send(message));
@@ -1751,9 +1753,8 @@ class SafeClient<T extends Record<string, ObjectType>> {
     // async query<K extends keyof T & string>(type: K, query: SafeDataQuery<T[K]>): Promise<GetSafeData<T[K]>[]> {}
 
     handleMessage(data: RawData, isBinary: boolean) {
-        console.log("<====", data.toString("utf-8"));
-
         const message = JSON.parse(data.toString()) as ClientMessage;
+        console.log("<====", util.inspect(message, { colors: true, breakLength: Number.POSITIVE_INFINITY }));
         if ("request" in message) {
             // Request response
             const handler = this.responseHandlers.get(message.request);
@@ -2053,12 +2054,64 @@ class Collection {
         }
     }
 
-    // async queryRaw(type: string, publicQuery: Record<string, any>) {
-    //     const res = await this.request({ type: "query", objectType: type, query: publicQuery });
-    //     if (res.type !== "query-response") {
-    //         throw new Error();
-    //     }
-    // }
+    async query<Pub = any, Priv = any>(tableName: string, publicQuery: Record<string, any>): Promise<{ id: number; public: Pub; private: Priv }[]> {
+        const results = await this.queryRaw(tableName, publicQuery);
+        const parsedResults: { id: number; public: Pub; private: Priv }[] = [];
+
+        for (let i = 0; i < results.length; i++) {
+            const result = results[i]!;
+            const privateData = JSON.parse(new TextDecoder().decode(result.private));
+
+            parsedResults.push({
+                id: result.id,
+                private: privateData,
+                public: result.public,
+            });
+        }
+
+        return parsedResults;
+    }
+
+    async queryRaw(tableName: string, publicQuery: Record<string, any>) {
+        const res = await this.client.request({
+            type: "query",
+            tableName: tableName,
+            query: publicQuery,
+            collectionId: this.id,
+        });
+        if (res.type !== "query-response") {
+            throw new Error();
+        }
+
+        const rows: { id: number; public: any; private: Uint8Array }[] = [];
+        for (let i = 0; i < res.data.length; i++) {
+            const [id, dataBase64, nonceBase64, publicData, collectionId, encryptedObjectKeyBase64] = res.data[i]!;
+
+            if (collectionId !== this.id) {
+                console.error("Cannot decrypt in query: collectionId !== this.id");
+                continue;
+            }
+
+            const objectKey = sodium.crypto_box_seal_open(decodeBase64(encryptedObjectKeyBase64), this.#publicKey, this.#privateKey);
+
+            const privateData = sodium.crypto_aead_chacha20poly1305_decrypt(
+                null,
+                decodeBase64(dataBase64),
+                null,
+                decodeBase64(nonceBase64),
+                objectKey,
+                "uint8array"
+            );
+
+            rows.push({
+                id: id,
+                private: privateData,
+                public: publicData,
+            });
+        }
+
+        return rows;
+    }
 }
 
 function zodToType<K extends string, Schema extends z.ZodObject<{ public: z.ZodType; private: z.ZodType }>>(
@@ -2118,7 +2171,7 @@ async function main() {
         console.log("created profile with id", id);
     } else {
         console.log("profile", profile);
-        col.update("Profile", 3, {
+        await col.update("Profile", 3, {
             private: {
                 ...profile.private,
                 age: profile.private.age + 1,
