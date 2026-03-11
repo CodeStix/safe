@@ -57,6 +57,13 @@ type ServerMessage =
           //   encryptedObjectKeyNonceBase64: string;
       }
     | {
+          type: "add";
+          tableName: string;
+          id: number;
+          collectionId: number;
+          encryptedObjectKeyBase64: string;
+      }
+    | {
           type: "create-collection";
           name: string;
           publicKeyBase64: string;
@@ -732,6 +739,70 @@ class SafeServer {
                     request: msg.request,
                     id: Number(obj.id),
                 });
+                break;
+            }
+
+            case "add": {
+                if (!user) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
+                    break;
+                }
+
+                const objectRights = await this.prisma.groupCollection.findFirst({
+                    where: {
+                        collection: {
+                            objects: {
+                                some: {
+                                    objectId: msg.id,
+                                },
+                            },
+                        },
+                        group: {
+                            users: {
+                                some: {
+                                    userId: user.id,
+                                },
+                            },
+                        },
+                        canShare: true,
+                    },
+                    select: {
+                        canShare: true,
+                    },
+                });
+
+                const collectionRights = await this.prisma.groupCollection.findFirst({
+                    where: {
+                        collectionId: msg.collectionId,
+                        group: {
+                            users: {
+                                some: {
+                                    userId: user.id,
+                                },
+                            },
+                        },
+                        canAdd: true,
+                    },
+                    select: {
+                        canAdd: true,
+                    },
+                });
+
+                if (!objectRights || !collectionRights) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to add object to collection" });
+                    break;
+                }
+
+                const encryptedObjectKey = Buffer.from(msg.encryptedObjectKeyBase64, "base64");
+
+                await this.prisma.collectionObject.create({
+                    data: {
+                        encryptedObjectKey: encryptedObjectKey,
+                        collectionId: msg.collectionId,
+                        objectId: msg.id,
+                    },
+                });
+
                 break;
             }
 

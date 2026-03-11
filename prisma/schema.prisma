@@ -83,6 +83,7 @@ model GroupCollection {
   canWrite    Boolean // Can update objects in this collection
   canRead     Boolean // Can read objects in this collection
   canQuery    Boolean // Can query objects from this collection
+  canShare    Boolean  @default(true) // Can share objects from this collection
   canModerate Boolean // Can add/remove groups/users from this collection and adjust permissions
   readFields  String[]
   writeFields String[]
