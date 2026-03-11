@@ -16,10 +16,12 @@ datasource db {
 }
 
 model User {
-  id          String @id @default(uuid())
-  userName    String @unique
-  selfGroup   Group  @relation(fields: [selfGroupId], references: [id], name: "SelfGroupUser")
-  selfGroupId String @unique
+  id                   String     @id @default(uuid())
+  userName             String     @unique
+  personalGroup        Group      @relation(fields: [personalGroupId], references: [id])
+  personalGroupId      String     @unique
+  personalCollection   Collection @relation(fields: [personalCollectionId], references: [id])
+  personalCollectionId String     @unique
   // admin       Boolean @default(false) // Admins are allowed to create new object types
 
   // authKey: Deviced from the master user password. authKey = pwhash(password, authSalt)
@@ -42,16 +44,23 @@ model GroupUser {
   groupId String
   group   Group  @relation(fields: [groupId], references: [id])
 
+  role                     GroupRole
   encryptedGroupPrivateKey Bytes // Encrypted using User public key
   // encryptedGroupPrivateKeyNonce Bytes 
 
   @@id([userId, groupId])
 }
 
+enum GroupRole {
+  Reader
+  Moderator // Can add/remove users to the group, but not moderators
+  Admin // Can add/remove users, including moderators and delete the group
+}
+
 model Group {
   id String @id @default(uuid())
 
-  selfUser User? @relation(name: "SelfGroupUser")
+  personalUser User? @relation()
 
   name      String
   publicKey Bytes
@@ -69,11 +78,12 @@ model GroupCollection {
 
   encryptedCollectionPrivateKey Bytes
 
-  canAdd      Boolean
-  canRemove   Boolean
-  canWrite    Boolean
-  canRead     Boolean
-  canQuery    Boolean
+  canAdd      Boolean // Can add objects to this collection
+  canRemove   Boolean // Can remove objects from this collection
+  canWrite    Boolean // Can update objects in this collection
+  canRead     Boolean // Can read objects in this collection
+  canQuery    Boolean // Can query objects from this collection
+  canModerate Boolean // Can add/remove groups/users from this collection and adjust permissions
   readFields  String[]
   writeFields String[]
 
@@ -88,6 +98,8 @@ model Collection {
   name      String
   publicKey Bytes
   // privateKey: stored in GroupCollection
+
+  personalUser User? @relation()
 }
 
 model CollectionObject {

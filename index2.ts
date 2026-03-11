@@ -32,6 +32,9 @@ type ServerMessage =
 
           groupPublicKeyBase64: string;
           groupEncryptedPrivateKeyBase64: string;
+
+          collectionPublicKeyBase64: string;
+          collectionEncryptedPrivateKeyBase64: string;
           //   groupEncryptedPrivateKeyNonceBase64: string;
       }
     | {
@@ -192,7 +195,8 @@ type ClientMessage =
           //   groupId: string;
           //   groupPublicKeyBase64: string;
           //   groupEncryptedPrivateKeyBase64: string;
-          selfGroupId: string;
+          personalGroupId: string;
+          personalCollectionId: string;
           groups: {
               id: string;
               publicKeyBase64: string;
@@ -250,7 +254,7 @@ type ClientMessage =
     | {
           type: "get-user-groups-response";
           request: number;
-          selfGroupId: string;
+          personalGroupId: string;
           groups: {
               id: string;
               publicKeyBase64: string;
@@ -424,6 +428,9 @@ class SafeServer {
 
                 const groupPublicKey = decodeBase64(msg.groupPublicKeyBase64);
                 const groupEncryptedPrivateKey = decodeBase64(msg.groupEncryptedPrivateKeyBase64);
+
+                const collectionPublicKey = decodeBase64(msg.collectionPublicKeyBase64);
+                const collectionEncryptedPrivateKey = decodeBase64(msg.collectionEncryptedPrivateKeyBase64);
                 // const groupEncryptedPrivateKeyNonce = decodeBase64(msg.groupEncryptedPrivateKeyNonceBase64);
 
                 const hashedAuthKey = sodium.crypto_generichash(32, authKey, null) as Uint8Array<ArrayBuffer>;
@@ -432,7 +439,14 @@ class SafeServer {
                     const group = await prisma.group.create({
                         data: {
                             publicKey: groupPublicKey,
-                            name: "UserGroup",
+                            name: "PersonalGroup",
+                        },
+                    });
+
+                    const collection = await prisma.collection.create({
+                        data: {
+                            name: "PersonalCollection",
+                            publicKey: collectionPublicKey,
                         },
                     });
 
@@ -448,7 +462,8 @@ class SafeServer {
                             encryptedPrivateKeyNonce: encryptedPrivateKeyNonce,
                             encryptionSalt: encryptionSalt,
 
-                            selfGroupId: group.id,
+                            personalGroupId: group.id,
+                            personalCollectionId: collection.id,
                         },
                         select: {
                             id: true,
@@ -460,6 +475,21 @@ class SafeServer {
                             encryptedGroupPrivateKey: groupEncryptedPrivateKey,
                             groupId: group.id,
                             userId: user.id,
+                            role: "Reader", // Do not allow adding other users to personal group
+                        },
+                    });
+
+                    await prisma.groupCollection.create({
+                        data: {
+                            collectionId: collection.id,
+                            groupId: group.id,
+                            canAdd: true,
+                            canQuery: true,
+                            canRead: true,
+                            canRemove: true,
+                            canWrite: true,
+                            canModerate: false, // Do not allow sharing the personal collection
+                            encryptedCollectionPrivateKey: collectionEncryptedPrivateKey,
                         },
                     });
 
@@ -516,7 +546,8 @@ class SafeServer {
                         //         },
                         //     },
                         // },
-                        selfGroupId: true,
+                        personalGroupId: true,
+                        personalCollectionId: true,
                         groups: {
                             select: {
                                 encryptedGroupPrivateKey: true,
@@ -560,7 +591,8 @@ class SafeServer {
                     // groupId: user.selfGroup!.group.id,
                     // groupPublicKeyBase64: encodeBase64(user.selfGroup!.group.publicKey),
                     // groupEncryptedPrivateKeyBase64: encodeBase64(user.selfGroup!.encryptedGroupPrivateKey),
-                    selfGroupId: user.selfGroupId,
+                    personalGroupId: user.personalGroupId,
+                    personalCollectionId: user.personalCollectionId,
                     groups: user.groups.map((e) => ({
                         id: e.group.id,
                         publicKeyBase64: encodeBase64(e.group.publicKey),
@@ -584,7 +616,8 @@ class SafeServer {
                         id: user.id,
                     },
                     select: {
-                        selfGroupId: true,
+                        personalGroupId: true,
+                        personalCollectionId: true,
                         groups: {
                             select: {
                                 encryptedGroupPrivateKey: true,
@@ -605,7 +638,7 @@ class SafeServer {
                 wsUser.send({
                     type: "get-user-groups-response",
                     request: msg.request,
-                    selfGroupId: userObj.selfGroupId,
+                    personalGroupId: userObj.personalGroupId,
                     groups: userObj.groups.map((e) => ({
                         id: e.group.id,
                         publicKeyBase64: encodeBase64(e.group.publicKey),
@@ -840,13 +873,14 @@ class SafeServer {
                         name: msg.name,
                         groups: {
                             create: {
-                                groupId: user.selfGroupId,
+                                groupId: user.personalGroupId,
                                 encryptedCollectionPrivateKey: encryptedPrivateKey,
                                 canAdd: true,
                                 canQuery: true,
                                 canRead: true,
                                 canRemove: true,
                                 canWrite: true,
+                                canModerate: true,
                                 readFields: [],
                                 writeFields: [],
                             },
@@ -1476,7 +1510,8 @@ class SafeClient<T extends Record<string, ObjectType>> {
     private userPublicKey?: Uint8Array;
     private userPrivateKey?: Uint8Array;
     private groups?: ClientGroup[];
-    private selfGroupId?: string;
+    private personalGroupId?: string;
+    private personalCollectionId?: string;
 
     static currentRequestId: number = 1;
 
@@ -1545,9 +1580,14 @@ class SafeClient<T extends Record<string, ObjectType>> {
         // const encryptedGroupPrivateKeyNonce = sodium.randombytes_buf(sodium.crypto_aead_chacha20poly1305_NPUBBYTES);
         const encryptedGroupPrivateKey = sodium.crypto_box_seal(groupKeypair.privateKey, userKeypair.publicKey);
 
+        // Personal collection
+        const collectionKeypair = sodium.crypto_box_keypair();
+        const encryptedCollectionPrivateKey = sodium.crypto_box_seal(collectionKeypair.privateKey, groupKeypair.publicKey);
+
         console.timeEnd("register");
         console.log("user keypair", userKeypair);
         console.log("group keypair", groupKeypair);
+        console.log("collection keypair", collectionKeypair);
 
         const res = await this.request({
             type: "register",
@@ -1560,6 +1600,8 @@ class SafeClient<T extends Record<string, ObjectType>> {
             publicKeyBase64: encodeBase64(userKeypair.publicKey),
             groupPublicKeyBase64: encodeBase64(groupKeypair.publicKey),
             groupEncryptedPrivateKeyBase64: encodeBase64(encryptedGroupPrivateKey),
+            collectionPublicKeyBase64: encodeBase64(collectionKeypair.publicKey),
+            collectionEncryptedPrivateKeyBase64: encodeBase64(encryptedCollectionPrivateKey),
             // groupEncryptedPrivateKeyNonceBase64: encodeBase64(encryptedGroupPrivateKeyNonce),
         });
         if (res.type !== "register-response") throw new Error();
@@ -1609,7 +1651,8 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
         this.userPublicKey = publicKey;
         this.userPrivateKey = privateKey;
-        this.selfGroupId = loginResponse.selfGroupId;
+        this.personalGroupId = loginResponse.personalGroupId;
+        this.personalCollectionId = loginResponse.personalCollectionId;
 
         // this.groupPublicKey = groupPublicKey;
         // this.groupPrivateKey = groupPrivateKey;
@@ -1711,13 +1754,13 @@ class SafeClient<T extends Record<string, ObjectType>> {
     async createCollection(name: string) {
         await sodium.ready;
 
-        const selfGroup = this.getSelfGroup();
-        if (!selfGroup) {
+        const personalGroup = this.getPersonalGroup();
+        if (!personalGroup) {
             throw new Error("selfGroup == null");
         }
 
         const collectionKeypair = sodium.crypto_box_keypair();
-        const encryptedCollectionPrivateKey = sodium.crypto_box_seal(collectionKeypair.privateKey, selfGroup.publicKey);
+        const encryptedCollectionPrivateKey = sodium.crypto_box_seal(collectionKeypair.privateKey, personalGroup.publicKey);
 
         const res = await this.request({
             type: "create-collection",
@@ -1743,11 +1786,18 @@ class SafeClient<T extends Record<string, ObjectType>> {
         return this.groups?.find((e) => e.id === id);
     }
 
-    getSelfGroup() {
-        if (!this.selfGroupId) {
+    getPersonalGroup() {
+        if (!this.personalGroupId) {
             return undefined;
         }
-        return this.getLocalGroup(this.selfGroupId);
+        return this.getLocalGroup(this.personalGroupId);
+    }
+
+    async getPersonalCollection() {
+        if (!this.personalCollectionId) {
+            return undefined;
+        }
+        return await this.getCollection(this.personalCollectionId);
     }
 
     // async query<K extends keyof T & string>(type: K, query: SafeDataQuery<T[K]>): Promise<GetSafeData<T[K]>[]> {}
@@ -2152,12 +2202,15 @@ async function main() {
 
     const client = new SafeClient("ws://localhost:8080", settings);
 
-    await client.login("stijn", "Vrijdag1@");
+    await client.login("stijn3", "Vrijdag1@");
 
-    const col = await client.getOrCreateCollection("user");
+    const col = (await client.getPersonalCollection())!;
 
-    const profile = await col.get<{ note: string }, { name: string; email: string; age: number }>("Profile", 3);
-    if (!profile) {
+    const profiles = await col.query("Profile", {});
+    // console.log(profiles);
+
+    // const profile = await col.get<{ note: string }, { name: string; email: string; age: number }>("Profile", 3);
+    if (profiles.length <= 0) {
         const id = await col.create("Profile", {
             private: {
                 name: "stijn rogiest",
@@ -2170,6 +2223,7 @@ async function main() {
         });
         console.log("created profile with id", id);
     } else {
+        const profile = profiles[0]!;
         console.log("profile", profile);
         await col.update("Profile", 3, {
             private: {
