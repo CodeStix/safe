@@ -52,7 +52,7 @@ type ServerMessage =
           dataBase64: string;
           nonceBase64: string;
           publicData: any;
-          collectionId: string;
+          collectionId: number;
           encryptedObjectKeyBase64: string;
           //   encryptedObjectKeyNonceBase64: string;
       }
@@ -64,12 +64,12 @@ type ServerMessage =
       }
     | {
           type: "get-collection";
-          id: string;
+          id: number;
       }
     | {
           type: "get-collections";
           name: string;
-          inGroupId?: string;
+          //   inGroupId?: string;
       }
     | {
           type: "update";
@@ -83,12 +83,12 @@ type ServerMessage =
           type: "get";
           id: number;
           tableName: string;
-          collectionId: string;
+          collectionId: number;
       }
     | {
           type: "query";
           tableName: string;
-          collectionId: string;
+          collectionId: number;
           query: Record<string, any>;
       }
     | {
@@ -107,7 +107,7 @@ type ServerMessage =
       }
     | {
           type: "update-group";
-          groupId: string;
+          groupId: number;
           policies: GroupPolicyDescription[];
       };
 
@@ -150,28 +150,28 @@ type ClientMessage =
     | {
           type: "create-collection-response";
           request: number;
-          collectionId: string;
+          collectionId: number;
       }
     | {
           type: "get-collections-response";
           request: number;
           collections: {
-              id: string;
+              id: number;
               name: string;
               encryptedPrivateKeyBase64: string;
               publicKeyBase64: string;
-              groupId: string;
+              groupId: number;
           }[];
       }
     | {
           type: "get-collection-response";
           request: number;
           collection: {
-              id: string;
+              id: number;
               name: string;
               encryptedPrivateKeyBase64: string;
               publicKeyBase64: string;
-              groupId: string;
+              groupId: number;
           } | null;
       }
     | {
@@ -195,10 +195,10 @@ type ClientMessage =
           //   groupId: string;
           //   groupPublicKeyBase64: string;
           //   groupEncryptedPrivateKeyBase64: string;
-          personalGroupId: string;
-          personalCollectionId: string;
+          personalGroupId: number;
+          personalCollectionId: number;
           groups: {
-              id: string;
+              id: number;
               publicKeyBase64: string;
               encryptedGroupPrivateKeyBase64: string;
               //   allowCreate: boolean;
@@ -228,7 +228,7 @@ type ClientMessage =
           dataBase64?: string;
           nonceBase64?: string;
           publicData?: any;
-          collectionId?: string;
+          collectionId?: number;
           encryptedObjectKeyBase64?: string;
           //   encryptedObjectKeyNonceBase64?: string;
           //   version?: number;
@@ -246,7 +246,7 @@ type ClientMessage =
               dataBase64: string,
               nonceBase64: string,
               publicData: any,
-              collectionId: string,
+              collectionId: number,
               encryptedObjectKeyBase64: string
               //   encryptedObjectKeyNonceBase64: string
           ][];
@@ -254,9 +254,9 @@ type ClientMessage =
     | {
           type: "get-user-groups-response";
           request: number;
-          personalGroupId: string;
+          personalGroupId: number;
           groups: {
-              id: string;
+              id: number;
               publicKeyBase64: string;
               encryptedGroupPrivateKeyBase64: string;
               //   allowCreate: boolean;
@@ -275,7 +275,7 @@ type ClientMessage =
       };
 
 class AuthenticatedUser {
-    constructor(public socket: WebSocket, public userId: string | undefined) {}
+    constructor(public socket: WebSocket, public userId: number | undefined) {}
 
     send(msg: ClientMessage) {
         this.socket.send(JSON.stringify(msg));
@@ -496,7 +496,7 @@ class SafeServer {
                     return user;
                 });
 
-                this.userPerSocket.set(ws, new AuthenticatedUser(ws, user.id));
+                this.userPerSocket.set(ws, new AuthenticatedUser(ws, Number(user.id)));
 
                 wsUser.send({ type: "register-response", request: msg.request });
 
@@ -577,7 +577,7 @@ class SafeServer {
 
                 delete (user as any).authHashedKey;
 
-                this.userPerSocket.set(ws, new AuthenticatedUser(ws, user.id));
+                this.userPerSocket.set(ws, new AuthenticatedUser(ws, Number(user.id)));
 
                 wsUser.send({
                     type: "login-response",
@@ -591,10 +591,10 @@ class SafeServer {
                     // groupId: user.selfGroup!.group.id,
                     // groupPublicKeyBase64: encodeBase64(user.selfGroup!.group.publicKey),
                     // groupEncryptedPrivateKeyBase64: encodeBase64(user.selfGroup!.encryptedGroupPrivateKey),
-                    personalGroupId: user.personalGroupId,
-                    personalCollectionId: user.personalCollectionId,
+                    personalGroupId: Number(user.personalGroupId),
+                    personalCollectionId: Number(user.personalCollectionId),
                     groups: user.groups.map((e) => ({
-                        id: e.group.id,
+                        id: Number(e.group.id),
                         publicKeyBase64: encodeBase64(e.group.publicKey),
                         encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
                         // allowCreate: e.allowCreate,
@@ -638,9 +638,9 @@ class SafeServer {
                 wsUser.send({
                     type: "get-user-groups-response",
                     request: msg.request,
-                    personalGroupId: userObj.personalGroupId,
+                    personalGroupId: Number(userObj.personalGroupId),
                     groups: userObj.groups.map((e) => ({
-                        id: e.group.id,
+                        id: Number(e.group.id),
                         publicKeyBase64: encodeBase64(e.group.publicKey),
                         encryptedGroupPrivateKeyBase64: encodeBase64(e.encryptedGroupPrivateKey),
                         // allowCreate: e.allowCreate,
@@ -894,7 +894,7 @@ class SafeServer {
                 wsUser.send({
                     type: "create-collection-response",
                     request: msg.request,
-                    collectionId: collection.id,
+                    collectionId: Number(collection.id),
                 });
 
                 break;
@@ -949,11 +949,11 @@ class SafeServer {
                     request: msg.request,
                     collection: collection
                         ? {
-                              id: collection.id,
+                              id: Number(collection.id),
                               name: collection.name,
                               publicKeyBase64: Buffer.from(collection.publicKey).toString("base64"),
                               encryptedPrivateKeyBase64: Buffer.from(collection.groups[0]!.encryptedCollectionPrivateKey).toString("base64"),
-                              groupId: collection.groups[0]!.groupId,
+                              groupId: Number(collection.groups[0]!.groupId),
                           }
                         : null,
                 });
@@ -1009,11 +1009,11 @@ class SafeServer {
                     type: "get-collections-response",
                     request: msg.request,
                     collections: collections.map((e) => ({
-                        id: e.id,
+                        id: Number(e.id),
                         name: e.name,
                         publicKeyBase64: Buffer.from(e.publicKey).toString("base64"),
                         encryptedPrivateKeyBase64: Buffer.from(e.groups[0]!.encryptedCollectionPrivateKey).toString("base64"),
-                        groupId: e.groups[0]!.groupId,
+                        groupId: Number(e.groups[0]!.groupId),
                     })),
                 });
 
@@ -1248,7 +1248,7 @@ class SafeServer {
                     dataBase64: string,
                     nonceBase64: string,
                     publicData: any,
-                    collectionId: string,
+                    collectionId: number,
                     encryptedObjectKeyBase64: string
                     // encryptedObjectKeyNonceBase64: string
                 ][] = [];
@@ -1260,7 +1260,7 @@ class SafeServer {
                         Buffer.from(row.data).toString("base64"),
                         Buffer.from(row.nonce).toString("base64"),
                         row.publicData,
-                        collection.collectionId,
+                        Number(collection.collectionId),
                         Buffer.from(collection.encryptedObjectKey).toString("base64"),
                         // Buffer.from(group.encryptedObjectKeyNonce).toString("base64"),
                     ]);
@@ -1348,7 +1348,7 @@ class SafeServer {
                         dataBase64: Buffer.from(obj.data).toString("base64"),
                         nonceBase64: Buffer.from(obj.nonce).toString("base64"),
                         publicData: obj.publicData,
-                        collectionId: collection.collectionId,
+                        collectionId: Number(collection.collectionId),
                         encryptedObjectKeyBase64: Buffer.from(collection.encryptedObjectKey).toString("base64"),
                         // encryptedObjectKeyNonceBase64: Buffer.from(group.encryptedObjectKeyNonce).toString("base64"),
                     });
@@ -1496,7 +1496,7 @@ class SafeSettings<T> {
 // f.set("User");
 
 interface ClientGroup {
-    id: string;
+    id: number;
     publicKey: Uint8Array;
     privateKey: Uint8Array;
 }
@@ -1510,8 +1510,8 @@ class SafeClient<T extends Record<string, ObjectType>> {
     private userPublicKey?: Uint8Array;
     private userPrivateKey?: Uint8Array;
     private groups?: ClientGroup[];
-    private personalGroupId?: string;
-    private personalCollectionId?: string;
+    private personalGroupId?: number;
+    private personalCollectionId?: number;
 
     static currentRequestId: number = 1;
 
@@ -1709,7 +1709,7 @@ class SafeClient<T extends Record<string, ObjectType>> {
     //     this.keyPerId.set(id, key);
     // }
 
-    async getCollection(id: string) {
+    async getCollection(id: number) {
         const res = await this.request({
             type: "get-collection",
             id: id,
@@ -1782,22 +1782,22 @@ class SafeClient<T extends Record<string, ObjectType>> {
         return await this.createCollection(name);
     }
 
-    getLocalGroup(id: string) {
+    getLocalGroup(id: number) {
         return this.groups?.find((e) => e.id === id);
     }
 
     getPersonalGroup() {
         if (!this.personalGroupId) {
-            return undefined;
+            throw new Error("Not authenticated");
         }
-        return this.getLocalGroup(this.personalGroupId);
+        return this.getLocalGroup(this.personalGroupId)!;
     }
 
     async getPersonalCollection() {
         if (!this.personalCollectionId) {
-            return undefined;
+            throw new Error("Not authenticated");
         }
-        return await this.getCollection(this.personalCollectionId);
+        return (await this.getCollection(this.personalCollectionId))!;
     }
 
     // async query<K extends keyof T & string>(type: K, query: SafeDataQuery<T[K]>): Promise<GetSafeData<T[K]>[]> {}
@@ -1824,12 +1824,12 @@ class SafeClient<T extends Record<string, ObjectType>> {
 
 class Collection {
     readonly client: SafeClient<any>;
-    readonly id: string;
+    readonly id: number;
 
     #publicKey: Uint8Array;
     #privateKey: Uint8Array;
 
-    constructor(client: SafeClient<any>, id: string, publicKey: Uint8Array, privateKey: Uint8Array) {
+    constructor(client: SafeClient<any>, id: number, publicKey: Uint8Array, privateKey: Uint8Array) {
         this.client = client;
         this.id = id;
         this.#privateKey = privateKey;
@@ -2202,9 +2202,9 @@ async function main() {
 
     const client = new SafeClient("ws://localhost:8080", settings);
 
-    await client.login("stijn3", "Vrijdag1@");
+    await client.login("stijn", "Vrijdag1@");
 
-    const col = (await client.getPersonalCollection())!;
+    const col = await client.getPersonalCollection();
 
     const profiles = await col.query("Profile", {});
     // console.log(profiles);
@@ -2225,7 +2225,7 @@ async function main() {
     } else {
         const profile = profiles[0]!;
         console.log("profile", profile);
-        await col.update("Profile", 3, {
+        await col.update("Profile", profile.id, {
             private: {
                 ...profile.private,
                 age: profile.private.age + 1,

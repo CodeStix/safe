@@ -16,12 +16,12 @@ datasource db {
 }
 
 model User {
-  id                   String     @id @default(uuid())
+  id                   BigInt     @id @default(autoincrement())
   userName             String     @unique
   personalGroup        Group      @relation(fields: [personalGroupId], references: [id])
-  personalGroupId      String     @unique
+  personalGroupId      BigInt     @unique
   personalCollection   Collection @relation(fields: [personalCollectionId], references: [id])
-  personalCollectionId String     @unique
+  personalCollectionId BigInt     @unique
   // admin       Boolean @default(false) // Admins are allowed to create new object types
 
   // authKey: Deviced from the master user password. authKey = pwhash(password, authSalt)
@@ -39,9 +39,9 @@ model User {
 }
 
 model GroupUser {
-  userId  String
+  userId  BigInt
   user    User   @relation(fields: [userId], references: [id])
-  groupId String
+  groupId BigInt
   group   Group  @relation(fields: [groupId], references: [id])
 
   role                     GroupRole
@@ -58,7 +58,7 @@ enum GroupRole {
 }
 
 model Group {
-  id String @id @default(uuid())
+  id BigInt @id @default(autoincrement())
 
   personalUser User? @relation()
 
@@ -71,9 +71,9 @@ model Group {
 }
 
 model GroupCollection {
-  groupId      String
+  groupId      BigInt
   group        Group      @relation(fields: [groupId], references: [id])
-  collectionId String
+  collectionId BigInt
   collection   Collection @relation(fields: [collectionId], references: [id])
 
   encryptedCollectionPrivateKey Bytes
@@ -91,7 +91,7 @@ model GroupCollection {
 }
 
 model Collection {
-  id      String             @id @default(uuid())
+  id      BigInt             @id @default(autoincrement())
   groups  GroupCollection[]
   objects CollectionObject[]
 
@@ -103,7 +103,7 @@ model Collection {
 }
 
 model CollectionObject {
-  collectionId String
+  collectionId BigInt
   collection   Collection @relation(fields: [collectionId], references: [id])
   objectId     BigInt
   object       Object     @relation(fields: [objectId], references: [id])
