@@ -15,6 +15,8 @@ datasource db {
   provider = "postgresql"
 }
 
+// INSERT INTO "TablePermission"("tableName", "groupId", "canDelete", "canInsert", "canQuery", "canRead", "canUpdate") VALUES('Profile', 2, true, true, true, true, true);
+
 model User {
   id                   BigInt     @id @default(autoincrement())
   userName             String     @unique
@@ -66,7 +68,7 @@ model Group {
   publicKey Bytes
   // privateKey: stored in GroupUserPermission
 
-  canCreateCollections Boolean
+  canCreateCollections Boolean @default(false)
 
   users       GroupUser[]
   collections GroupCollection[]
@@ -80,6 +82,7 @@ model GroupCollection {
   collection   Collection @relation(fields: [collectionId], references: [id])
 
   encryptedCollectionPrivateKey Bytes
+  // encryptedUsingKeyVersion      Int
 
   canAdd      Boolean // Can add objects to this collection
   canRemove   Boolean // Can remove objects from this collection
@@ -113,6 +116,8 @@ model CollectionObject {
   object       Object     @relation(fields: [objectId], references: [id])
 
   encryptedObjectKey Bytes // Encrypted using Collection public key
+
+  // encryptedUsingKeyVersion Int
   // encryptedObjectKeyNonce Bytes
   // encryptedColumnKeys Json // Encrypted
 
@@ -133,21 +138,32 @@ model Object {
   @@index([tableName])
 }
 
+// when obbject unshared from collection 3:
+// list of current collections is returned -> [1,2,3]
+// objectKey is re-genenerated
+// objectKey is encrypted with public key of 1 and 2 (not 3)
+// update CollectionObject rows withh new encrypted object keys
+
+// when collection 2 unshared from group 5:
+// list of current groups is returned -> [3,4,5]
+// collection keypair is re-generated
+// privateKey is encrypted with public key of group 3 and 4 (not 5)
+// update GroupCollection rows with their new encrypted private keys
+// every object key in the collection 
+
+// when user 10 is removed from group 20
+// list of current users is returned -> [10,11,12]
+// group keypair is regenerated
+// privateKey is encrypted with public key of user 11 and 12 (not 10)
+// update GroupUser rows with their new encrypted private keys
+// 
+
 model TableDescriptor {
   tableName   String            @id @unique
   description Json
   objects     Object[]
   permissions TablePermission[]
 }
-
-// model ObjectType {
-//   id                 Int    @id @default(autoincrement())
-//   type               String @unique
-//   maxPrivateDataSize Int
-//   publicDataSchema   String
-
-//   objects Object[]
-// }
 
 model TablePermission {
   tableName String

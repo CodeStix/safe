@@ -5,10 +5,11 @@ import { IncomingMessage } from "http";
 import sodium, { crypto_box_curve25519xchacha20poly1305_keypair } from "libsodium-wrappers-sumo";
 import { RawData, WebSocket, WebSocketServer } from "ws";
 import * as z from "zod";
-import { Group, PrismaClient } from "./prisma/prisma/client";
+import { Group, PrismaClient, User } from "./prisma/prisma/client";
 import { PrismaPromise } from "@prisma/client/runtime/client";
 import util from "util";
 import fs from "fs/promises";
+import assert from "assert";
 
 // type ObjectTypeName = string;
 
@@ -312,8 +313,33 @@ class AuthenticatedUser {
             where: { id: this.userId },
             include: {
                 groups: {
-                    select: {
-                        groupId: true,
+                    include: {
+                        group: true,
+                    },
+                },
+            },
+        });
+    }
+
+    async getUserWithTablePermissions(prisma: PrismaClient, tableName: string) {
+        if (!this.userId) {
+            return null;
+        }
+
+        return await prisma.user.findUnique({
+            where: { id: this.userId },
+            include: {
+                groups: {
+                    include: {
+                        group: {
+                            include: {
+                                permissions: {
+                                    where: {
+                                        tableName: tableName,
+                                    },
+                                },
+                            },
+                        },
                     },
                 },
             },
@@ -377,6 +403,8 @@ class SafeServer {
     }
 
     async initialize() {
+        await sodium.ready;
+
         this.settings = await this.loadSettings();
 
         if (!this.settings.publicGroup) {
@@ -460,7 +488,62 @@ class SafeServer {
 
     async handleMessage(ws: WebSocket, msg: ServerMessage & { request: number }) {
         const wsUser = this.userPerSocket.get(ws) ?? new AuthenticatedUser(ws, undefined);
-        const user = await wsUser.getUser(this.prisma);
+
+        let user:
+            | (User & {
+                  groups: {
+                      group: {
+                          name: string;
+                          id: bigint;
+                          // publicKey: Bytes;
+                          canCreateCollections: boolean;
+                      };
+                  }[];
+              })
+            | null;
+        let tablePermission: {
+            canInsert: boolean;
+            canDelete: boolean;
+            canUpdate: boolean;
+            canRead: boolean;
+            canQuery: boolean;
+            readColumns: Set<string>;
+            writeColumns: Set<string>;
+        } | null = null;
+
+        const tableName = msg.type === "insert" || msg.type === "update" || msg.type === "get" || msg.type === "query" ? msg.tableName : undefined;
+        if (tableName !== undefined) {
+            tablePermission = {
+                canDelete: false,
+                canInsert: false,
+                canUpdate: false,
+                canRead: false,
+                canQuery: false,
+                readColumns: new Set(),
+                writeColumns: new Set(),
+            };
+
+            const userWithPermissions = await wsUser.getUserWithTablePermissions(this.prisma, tableName);
+            user = userWithPermissions;
+
+            // console.log(util.inspect(userWithPermissions, { colors: true, depth: 100 }));
+
+            for (const group of userWithPermissions!.groups) {
+                for (const permission of group.group.permissions) {
+                    assert.equal(permission.tableName, tableName);
+
+                    tablePermission.canInsert ||= permission.canInsert;
+                    tablePermission.canDelete ||= permission.canDelete;
+                    tablePermission.canUpdate ||= permission.canUpdate;
+                    tablePermission.canRead ||= permission.canRead;
+                    tablePermission.canQuery ||= permission.canQuery;
+                    permission.readColumns.forEach((e) => tablePermission!.readColumns.add(e));
+                    permission.writeColumns.forEach((e) => tablePermission!.writeColumns.add(e));
+                }
+            }
+        } else {
+            user = await wsUser.getUser(this.prisma);
+        }
 
         switch (msg.type) {
             // case "auth": {
@@ -512,8 +595,6 @@ class SafeServer {
 
                 const publicGroupPrivateKey = Buffer.from(this.settings.publicGroup!.privateKeyBase64, "base64");
                 const publicGroupEncryptedPrivateKey = sodium.crypto_box_seal(publicGroupPrivateKey, publicKey);
-
-                await sodium.ready;
 
                 const user = await this.prisma.$transaction(async (prisma) => {
                     const group = await prisma.group.create({
@@ -774,16 +855,15 @@ class SafeServer {
                 //     }
                 // }
 
-                const userRights = await this.prisma.groupCollection.findMany({
+                if (!tablePermission!.canInsert) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allow to insert data" });
+                    break;
+                }
+
+                const collectionPermission = await this.prisma.groupCollection.findFirst({
                     where: {
                         collectionId: msg.collectionId,
                         group: {
-                            permissions: {
-                                some: {
-                                    tableName: msg.tableName,
-                                    canInsert: true,
-                                },
-                            },
                             users: {
                                 some: {
                                     userId: user.id,
@@ -792,20 +872,9 @@ class SafeServer {
                         },
                         canAdd: true,
                     },
-                    select: {
-                        group: {
-                            select: {
-                                permissions: {
-                                    select: {
-                                        writeColumns: true,
-                                    },
-                                },
-                            },
-                        },
-                    },
                 });
 
-                if (userRights.length <= 0) {
+                if (!collectionPermission) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to add object to collection" });
                     break;
                 }
@@ -905,6 +974,9 @@ class SafeServer {
                     },
                 });
 
+                // TODO: object key should be changed, re-encrypted to each group
+                // TODO: shared groups state must be verified
+
                 wsUser.send({ type: "unshare-response", request: msg.request });
 
                 break;
@@ -926,12 +998,6 @@ class SafeServer {
                             },
                         },
                         group: {
-                            // permissions: {
-                            //     some: {
-                            //         tableName: msg.tableName,
-                            //         canShare: true,
-                            //     },
-                            // },
                             users: {
                                 some: {
                                     userId: user.id,
@@ -1000,7 +1066,12 @@ class SafeServer {
                     //     return;
                     // }
 
-                    const userRights = await this.prisma.groupCollection.findFirst({
+                    if (!tablePermission!.canUpdate) {
+                        wsUser.send({ type: "error-response", request: msg.request, message: "Not allow to update data" });
+                        return;
+                    }
+
+                    const collectionPermission = await this.prisma.groupCollection.findFirst({
                         where: {
                             collection: {
                                 objects: {
@@ -1015,29 +1086,15 @@ class SafeServer {
                                         userId: user.id,
                                     },
                                 },
-                                permissions: {
-                                    some: {
-                                        tableName: msg.tableName,
-                                        canUpdate: true,
-                                    },
-                                },
                             },
                             canWrite: true,
                         },
                         select: {
-                            group: {
-                                select: {
-                                    permissions: {
-                                        select: {
-                                            writeColumns: true,
-                                        },
-                                    },
-                                },
-                            },
+                            canWrite: true,
                         },
                     });
 
-                    if (!userRights) {
+                    if (!collectionPermission) {
                         wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to modify object in collection" });
                         return;
                     }
@@ -1131,18 +1188,8 @@ class SafeServer {
                     break;
                 }
 
-                const permission = await this.prisma.group.findFirst({
-                    where: {
-                        canCreateCollections: true,
-                        users: {
-                            some: {
-                                userId: user.id,
-                            },
-                        },
-                    },
-                });
-
-                if (!permission) {
+                const canCreateCollections = user.groups.some((e) => e.group.canCreateCollections);
+                if (!canCreateCollections) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to create collections" });
                     break;
                 }
@@ -1452,19 +1499,17 @@ class SafeServer {
                     break;
                 }
 
+                if (!tablePermission!.canQuery) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to query table" });
+                    break;
+                }
+
                 const collectionId = msg.collectionId;
 
-                const userRights = await this.prisma.groupCollection.findMany({
+                const collectionPermission = await this.prisma.groupCollection.findFirst({
                     where: {
                         collectionId: collectionId,
                         group: {
-                            permissions: {
-                                some: {
-                                    tableName: msg.tableName,
-                                    canQuery: true,
-                                    canRead: true,
-                                },
-                            },
                             users: {
                                 some: {
                                     userId: user.id,
@@ -1474,20 +1519,9 @@ class SafeServer {
                         canRead: true,
                         canQuery: true,
                     },
-                    select: {
-                        group: {
-                            select: {
-                                permissions: {
-                                    select: {
-                                        readColumns: true,
-                                    },
-                                },
-                            },
-                        },
-                    },
                 });
 
-                if (userRights.length <= 0) {
+                if (!collectionPermission) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to query objects in collection" });
                     return;
                 }
@@ -1585,13 +1619,18 @@ class SafeServer {
                     break;
                 }
 
+                if (!tablePermission!.canRead) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to read table" });
+                    break;
+                }
+
                 // const objectType = this.getType(msg.objectType);
                 // if (!objectType) {
                 //     wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
                 //     break;
                 // }
 
-                const userRights = await this.prisma.groupCollection.findMany({
+                const collectionPermission = await this.prisma.groupCollection.findFirst({
                     where: {
                         // collection: {
                         //     objects: {
@@ -1602,12 +1641,6 @@ class SafeServer {
                         // },
                         collectionId: msg.collectionId,
                         group: {
-                            permissions: {
-                                some: {
-                                    tableName: msg.tableName,
-                                    canRead: true,
-                                },
-                            },
                             users: {
                                 some: {
                                     userId: user.id,
@@ -1618,21 +1651,12 @@ class SafeServer {
                     },
                     select: {
                         collectionId: true,
-                        group: {
-                            select: {
-                                permissions: {
-                                    select: {
-                                        readColumns: true,
-                                    },
-                                },
-                            },
-                        },
                     },
                 });
 
                 // TODO: readColumns
 
-                if (userRights.length <= 0) {
+                if (!collectionPermission) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to read objects in collection" });
                     break;
                 }
@@ -1649,7 +1673,7 @@ class SafeServer {
                         collections: {
                             take: 1,
                             where: {
-                                collectionId: userRights[0]!.collectionId,
+                                collectionId: collectionPermission.collectionId,
                             },
                             select: {
                                 collectionId: true,
@@ -2518,10 +2542,11 @@ async function main() {
     const settings = new SafeSettings().withType(zodToType("User", User)).withType(zodToType("Profile", Profile));
 
     const server = new SafeServer(settings);
+    await server.initialize();
 
     const client = new SafeClient("ws://localhost:8080", settings);
 
-    await client.login("stijn", "Vrijdag1@");
+    await client.login("stijn4", "Vrijdag1@");
 
     const col = await client.getPersonalCollection();
 
