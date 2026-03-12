@@ -8,6 +8,7 @@ import * as z from "zod";
 import { Group, PrismaClient } from "./prisma/prisma/client";
 import { PrismaPromise } from "@prisma/client/runtime/client";
 import util from "util";
+import fs from "fs/promises";
 
 // type ObjectTypeName = string;
 
@@ -57,11 +58,18 @@ type ServerMessage =
           //   encryptedObjectKeyNonceBase64: string;
       }
     | {
-          type: "add";
-          tableName: string;
+          type: "share";
+          //   tableName: string;
           id: number;
           collectionId: number;
           encryptedObjectKeyBase64: string;
+      }
+    | {
+          type: "unshare";
+          //   tableName: string;
+          id: number;
+          collectionId: number;
+          // encryptedObjectKeyBase64: string;
       }
     | {
           type: "create-collection";
@@ -279,6 +287,14 @@ type ClientMessage =
           type: "create-group-response";
           request: number;
           groupId: string;
+      }
+    | {
+          type: "share-response";
+          request: number;
+      }
+    | {
+          type: "unshare-response";
+          request: number;
       };
 
 class AuthenticatedUser {
@@ -315,12 +331,21 @@ type ObjectType<K extends string = string, Private = any, Public = any> = {
     // publicDataTransformer?: ObjectValidator;
 };
 
+type SafeServerConfig = {
+    publicGroup?: {
+        id: number;
+        publicKeyBase64: string;
+        privateKeyBase64: string;
+    };
+};
+
 class SafeServer {
     socket: WebSocketServer;
     prisma: PrismaClient;
     userPerSocket = new Map<WebSocket, AuthenticatedUser>();
     lock: AsyncLock;
     objectTypes = new Map<string, Omit<ObjectType, "privateDataValidator">>();
+    settings!: SafeServerConfig;
 
     constructor(settings: SafeSettings<any>) {
         this.socket = new WebSocketServer({ port: 8080 });
@@ -332,6 +357,49 @@ class SafeServer {
         this.lock = new AsyncLock();
 
         this.objectTypes = new Map(Object.entries(settings.objectTypes));
+    }
+
+    async loadSettings(): Promise<SafeServerConfig> {
+        try {
+            return JSON.parse(await fs.readFile("settings.json", "utf-8")) as SafeServerConfig;
+        } catch (ex) {
+            console.error("Could not load settings file", ex);
+            return {};
+        }
+    }
+
+    async saveSettings(settings: SafeServerConfig) {
+        try {
+            await fs.writeFile("settings.json", JSON.stringify(settings, null, 2));
+        } catch (ex) {
+            console.error("Could not save settings", ex);
+        }
+    }
+
+    async initialize() {
+        this.settings = await this.loadSettings();
+
+        if (!this.settings.publicGroup) {
+            const publicGroupKeyPair = sodium.crypto_box_keypair();
+
+            const publicGroup = await this.prisma.group.create({
+                data: {
+                    name: "Public",
+                    publicKey: Buffer.from(publicGroupKeyPair.publicKey),
+                    canCreateCollections: false,
+                },
+            });
+
+            this.settings.publicGroup = {
+                id: Number(publicGroup.id),
+                privateKeyBase64: Buffer.from(publicGroupKeyPair.privateKey).toString("base64"),
+                publicKeyBase64: Buffer.from(publicGroupKeyPair.publicKey).toString("base64"),
+            };
+
+            console.log("Created public group", util.inspect(this.settings.publicGroup, { colors: true }));
+
+            await this.saveSettings(this.settings);
+        }
     }
 
     // registerType(type: Omit<ObjectType, "privateDataValidator">) {
@@ -442,11 +510,17 @@ class SafeServer {
 
                 const hashedAuthKey = sodium.crypto_generichash(32, authKey, null) as Uint8Array<ArrayBuffer>;
 
+                const publicGroupPrivateKey = Buffer.from(this.settings.publicGroup!.privateKeyBase64, "base64");
+                const publicGroupEncryptedPrivateKey = sodium.crypto_box_seal(publicGroupPrivateKey, publicKey);
+
+                await sodium.ready;
+
                 const user = await this.prisma.$transaction(async (prisma) => {
                     const group = await prisma.group.create({
                         data: {
                             publicKey: groupPublicKey,
                             name: "PersonalGroup",
+                            canCreateCollections: false,
                         },
                     });
 
@@ -483,6 +557,15 @@ class SafeServer {
                             groupId: group.id,
                             userId: user.id,
                             role: "Reader", // Do not allow adding other users to personal group
+                        },
+                    });
+
+                    await prisma.groupUser.create({
+                        data: {
+                            encryptedGroupPrivateKey: Buffer.from(publicGroupEncryptedPrivateKey),
+                            userId: user.id,
+                            groupId: this.settings.publicGroup!.id,
+                            role: "Reader", // Do not allow adding other users to public group
                         },
                     });
 
@@ -691,10 +774,16 @@ class SafeServer {
                 //     }
                 // }
 
-                const userRights = await this.prisma.groupCollection.findFirst({
+                const userRights = await this.prisma.groupCollection.findMany({
                     where: {
                         collectionId: msg.collectionId,
                         group: {
+                            permissions: {
+                                some: {
+                                    tableName: msg.tableName,
+                                    canInsert: true,
+                                },
+                            },
                             users: {
                                 some: {
                                     userId: user.id,
@@ -704,15 +793,24 @@ class SafeServer {
                         canAdd: true,
                     },
                     select: {
-                        readFields: true,
-                        writeFields: true,
+                        group: {
+                            select: {
+                                permissions: {
+                                    select: {
+                                        writeColumns: true,
+                                    },
+                                },
+                            },
+                        },
                     },
                 });
 
-                if (!userRights) {
+                if (userRights.length <= 0) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to add object to collection" });
                     break;
                 }
+
+                // TODO: writeColumns
 
                 const encryptedObjectKey = Buffer.from(msg.encryptedObjectKeyBase64, "base64");
 
@@ -742,13 +840,13 @@ class SafeServer {
                 break;
             }
 
-            case "add": {
+            case "unshare": {
                 if (!user) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
                     break;
                 }
 
-                const objectRights = await this.prisma.groupCollection.findFirst({
+                const objectPermission = await this.prisma.groupCollection.findFirst({
                     where: {
                         collection: {
                             objects: {
@@ -764,14 +862,95 @@ class SafeServer {
                                 },
                             },
                         },
-                        canShare: true,
+                        // canShare: true,
                     },
                     select: {
                         canShare: true,
                     },
                 });
 
-                const collectionRights = await this.prisma.groupCollection.findFirst({
+                if (!objectPermission) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Object not found" });
+                    break;
+                }
+
+                const collectionPermission = await this.prisma.groupCollection.findFirst({
+                    where: {
+                        collectionId: msg.collectionId,
+                        group: {
+                            users: {
+                                some: {
+                                    userId: user.id,
+                                },
+                            },
+                        },
+                        canRemove: true,
+                    },
+                    select: {
+                        canRemove: true,
+                    },
+                });
+
+                if (!collectionPermission) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to remove object from collection" });
+                    break;
+                }
+
+                await this.prisma.collectionObject.delete({
+                    where: {
+                        collectionId_objectId: {
+                            collectionId: msg.collectionId,
+                            objectId: msg.id,
+                        },
+                    },
+                });
+
+                wsUser.send({ type: "unshare-response", request: msg.request });
+
+                break;
+            }
+
+            case "share": {
+                if (!user) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
+                    break;
+                }
+
+                const objectPermission = await this.prisma.groupCollection.findFirst({
+                    where: {
+                        collection: {
+                            objects: {
+                                some: {
+                                    objectId: msg.id,
+                                },
+                            },
+                        },
+                        group: {
+                            // permissions: {
+                            //     some: {
+                            //         tableName: msg.tableName,
+                            //         canShare: true,
+                            //     },
+                            // },
+                            users: {
+                                some: {
+                                    userId: user.id,
+                                },
+                            },
+                        },
+                        // canShare: true,
+                    },
+                    select: {
+                        canShare: true,
+                    },
+                });
+
+                if (!objectPermission) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Object not found" });
+                    break;
+                }
+
+                const collectionPermission = await this.prisma.groupCollection.findFirst({
                     where: {
                         collectionId: msg.collectionId,
                         group: {
@@ -788,7 +967,7 @@ class SafeServer {
                     },
                 });
 
-                if (!objectRights || !collectionRights) {
+                if (!collectionPermission) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to add object to collection" });
                     break;
                 }
@@ -802,6 +981,8 @@ class SafeServer {
                         objectId: msg.id,
                     },
                 });
+
+                wsUser.send({ type: "share-response", request: msg.request });
 
                 break;
             }
@@ -834,12 +1015,25 @@ class SafeServer {
                                         userId: user.id,
                                     },
                                 },
+                                permissions: {
+                                    some: {
+                                        tableName: msg.tableName,
+                                        canUpdate: true,
+                                    },
+                                },
                             },
                             canWrite: true,
                         },
                         select: {
-                            readFields: true,
-                            writeFields: true,
+                            group: {
+                                select: {
+                                    permissions: {
+                                        select: {
+                                            writeColumns: true,
+                                        },
+                                    },
+                                },
+                            },
                         },
                     });
 
@@ -847,6 +1041,8 @@ class SafeServer {
                         wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to modify object in collection" });
                         return;
                     }
+
+                    // TODO: writeColumns
 
                     const existingObj = await this.prisma.object.findUniqueOrThrow({
                         where: {
@@ -888,13 +1084,13 @@ class SafeServer {
 
                     // TODO: validate private data as well
                     const publicData = (existingObj.publicData ?? {}) as any;
-                    if (msg.publicData) {
-                        for (const k in msg.publicData) {
-                            if (userRights.writeFields.length <= 0 || userRights.writeFields.includes(k)) {
-                                publicData[k] = msg.publicData[k];
-                            }
-                        }
-                    }
+                    // if (msg.publicData) {
+                    //     for (const k in msg.publicData) {
+                    //         if (userRights.writeFields.length <= 0 || userRights.writeFields.includes(k)) {
+                    //             publicData[k] = msg.publicData[k];
+                    //         }
+                    //     }
+                    // }
 
                     // if (typeof msg.publicData !== "undefined") {
                     //     try {
@@ -935,6 +1131,22 @@ class SafeServer {
                     break;
                 }
 
+                const permission = await this.prisma.group.findFirst({
+                    where: {
+                        canCreateCollections: true,
+                        users: {
+                            some: {
+                                userId: user.id,
+                            },
+                        },
+                    },
+                });
+
+                if (!permission) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to create collections" });
+                    break;
+                }
+
                 const publicKey = Buffer.from(msg.publicKeyBase64, "base64");
                 const encryptedPrivateKey = Buffer.from(msg.selfEncryptedPrivateKeyBase64, "base64");
 
@@ -952,8 +1164,6 @@ class SafeServer {
                                 canRemove: true,
                                 canWrite: true,
                                 canModerate: true,
-                                readFields: [],
-                                writeFields: [],
                             },
                         },
                     },
@@ -977,41 +1187,48 @@ class SafeServer {
                     break;
                 }
 
-                const collection = await this.prisma.collection.findUnique({
+                const permission = await this.prisma.groupCollection.findFirst({
                     where: {
-                        id: msg.id,
-                        groups: {
-                            some: {
-                                group: {
-                                    users: {
-                                        some: {
-                                            userId: user.id,
-                                        },
-                                    },
+                        collectionId: msg.id,
+                        group: {
+                            users: {
+                                some: {
+                                    userId: user.id,
                                 },
                             },
                         },
+                    },
+                });
+
+                if (!permission) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Collection not found" });
+                    return;
+                }
+
+                const collection = await this.prisma.collection.findUnique({
+                    where: {
+                        id: msg.id,
                     },
                     select: {
                         id: true,
                         name: true,
                         publicKey: true,
-                        groups: {
-                            take: 1,
-                            where: {
-                                group: {
-                                    users: {
-                                        some: {
-                                            userId: user.id,
-                                        },
-                                    },
-                                },
-                            },
-                            select: {
-                                encryptedCollectionPrivateKey: true,
-                                groupId: true,
-                            },
-                        },
+                        // groups: {
+                        //     take: 1,
+                        //     where: {
+                        //         group: {
+                        //             users: {
+                        //                 some: {
+                        //                     userId: user.id,
+                        //                 },
+                        //             },
+                        //         },
+                        //     },
+                        //     select: {
+                        //         encryptedCollectionPrivateKey: true,
+                        //         groupId: true,
+                        //     },
+                        // },
                     },
                 });
 
@@ -1023,8 +1240,8 @@ class SafeServer {
                               id: Number(collection.id),
                               name: collection.name,
                               publicKeyBase64: Buffer.from(collection.publicKey).toString("base64"),
-                              encryptedPrivateKeyBase64: Buffer.from(collection.groups[0]!.encryptedCollectionPrivateKey).toString("base64"),
-                              groupId: Number(collection.groups[0]!.groupId),
+                              encryptedPrivateKeyBase64: Buffer.from(permission.encryptedCollectionPrivateKey).toString("base64"),
+                              groupId: Number(permission.groupId),
                           }
                         : null,
                 });
@@ -1241,6 +1458,13 @@ class SafeServer {
                     where: {
                         collectionId: collectionId,
                         group: {
+                            permissions: {
+                                some: {
+                                    tableName: msg.tableName,
+                                    canQuery: true,
+                                    canRead: true,
+                                },
+                            },
                             users: {
                                 some: {
                                     userId: user.id,
@@ -1251,8 +1475,15 @@ class SafeServer {
                         canQuery: true,
                     },
                     select: {
-                        readFields: true,
-                        writeFields: true,
+                        group: {
+                            select: {
+                                permissions: {
+                                    select: {
+                                        readColumns: true,
+                                    },
+                                },
+                            },
+                        },
                     },
                 });
 
@@ -1260,6 +1491,8 @@ class SafeServer {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to query objects in collection" });
                     return;
                 }
+
+                // TODO: readColumns
 
                 // const objectType = this.getType(msg.objectType);
                 // if (!objectType) {
@@ -1369,6 +1602,12 @@ class SafeServer {
                         // },
                         collectionId: msg.collectionId,
                         group: {
+                            permissions: {
+                                some: {
+                                    tableName: msg.tableName,
+                                    canRead: true,
+                                },
+                            },
                             users: {
                                 some: {
                                     userId: user.id,
@@ -1379,10 +1618,19 @@ class SafeServer {
                     },
                     select: {
                         collectionId: true,
-                        readFields: true,
-                        writeFields: true,
+                        group: {
+                            select: {
+                                permissions: {
+                                    select: {
+                                        readColumns: true,
+                                    },
+                                },
+                            },
+                        },
                     },
                 });
+
+                // TODO: readColumns
 
                 if (userRights.length <= 0) {
                     wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to read objects in collection" });

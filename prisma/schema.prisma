@@ -66,8 +66,11 @@ model Group {
   publicKey Bytes
   // privateKey: stored in GroupUserPermission
 
+  canCreateCollections Boolean
+
   users       GroupUser[]
   collections GroupCollection[]
+  permissions TablePermission[]
 }
 
 model GroupCollection {
@@ -83,10 +86,10 @@ model GroupCollection {
   canWrite    Boolean // Can update objects in this collection
   canRead     Boolean // Can read objects in this collection
   canQuery    Boolean // Can query objects from this collection
-  canShare    Boolean  @default(true) // Can share objects from this collection
+  canShare    Boolean @default(true) // Can share objects from this collection
   canModerate Boolean // Can add/remove groups/users from this collection and adjust permissions
-  readFields  String[]
-  writeFields String[]
+  // readFields  String[]
+  // writeFields String[]
 
   @@id([groupId, collectionId])
 }
@@ -121,7 +124,7 @@ model Object {
   id         BigInt          @id @default(autoincrement())
   tableName  String // User specified type of the object, eg "ShoppingItem", "UserProfile"
   table      TableDescriptor @relation(fields: [tableName], references: [tableName])
-  data       Bytes
+  data       Bytes // per column contains: list of collection ids it is shared with and version number of data key
   nonce      Bytes
   publicData Json? // You can add indices on specific json fields using postgres create index
 
@@ -131,9 +134,10 @@ model Object {
 }
 
 model TableDescriptor {
-  tableName   String   @id @unique
+  tableName   String            @id @unique
   description Json
   objects     Object[]
+  permissions TablePermission[]
 }
 
 // model ObjectType {
@@ -143,4 +147,32 @@ model TableDescriptor {
 //   publicDataSchema   String
 
 //   objects Object[]
+// }
+
+model TablePermission {
+  tableName String
+  groupId   BigInt
+
+  canInsert    Boolean
+  canDelete    Boolean
+  canUpdate    Boolean
+  canRead      Boolean
+  canQuery     Boolean
+  // canShare     Boolean
+  readColumns  String[]
+  writeColumns String[]
+
+  group Group           @relation(fields: [groupId], references: [id])
+  table TableDescriptor @relation(fields: [tableName], references: [tableName])
+
+  @@id([groupId, tableName])
+}
+
+// enum RolePermissionAction {
+//   Create // user can create row (certain columns)
+//   Read // user can read specific rows that it has access to (by id) (certain columns)
+//   Query // user can query multiple rows that is has access to (certain columns)
+//   Update // user can update rows that it has access to (certain columns)
+//   Delete // user ccan delete rows that it has access to
+//   Share // user can share rows that it has access to with group (certain groups)
 // }
