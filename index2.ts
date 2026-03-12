@@ -60,17 +60,22 @@ type ServerMessage =
       }
     | {
           type: "share";
-          //   tableName: string;
+          tableName: string;
           id: number;
           collectionId: number;
           encryptedObjectKeyBase64: string;
       }
     | {
           type: "unshare";
-          //   tableName: string;
+          tableName: string;
           id: number;
           collectionId: number;
           // encryptedObjectKeyBase64: string;
+      }
+    | {
+          type: "delete";
+          tableName: string;
+          id: number;
       }
     | {
           type: "create-collection";
@@ -99,7 +104,7 @@ type ServerMessage =
           type: "get";
           id: number;
           tableName: string;
-          collectionId: number;
+          //   collectionId: number;
       }
     | {
           type: "query";
@@ -295,6 +300,10 @@ type ClientMessage =
       }
     | {
           type: "unshare-response";
+          request: number;
+      }
+    | {
+          type: "delete-response";
           request: number;
       };
 
@@ -511,7 +520,10 @@ class SafeServer {
             writeColumns: Set<string>;
         } | null = null;
 
-        const tableName = msg.type === "insert" || msg.type === "update" || msg.type === "get" || msg.type === "query" ? msg.tableName : undefined;
+        const tableName =
+            msg.type === "delete" || msg.type === "insert" || msg.type === "update" || msg.type === "get" || msg.type === "query"
+                ? msg.tableName
+                : undefined;
         if (tableName !== undefined) {
             tablePermission = {
                 canDelete: false,
@@ -1040,8 +1052,17 @@ class SafeServer {
 
                 const encryptedObjectKey = Buffer.from(msg.encryptedObjectKeyBase64, "base64");
 
-                await this.prisma.collectionObject.create({
-                    data: {
+                await this.prisma.collectionObject.upsert({
+                    where: {
+                        collectionId_objectId: {
+                            collectionId: msg.collectionId,
+                            objectId: msg.id,
+                        },
+                    },
+                    update: {
+                        encryptedObjectKey: encryptedObjectKey,
+                    },
+                    create: {
                         encryptedObjectKey: encryptedObjectKey,
                         collectionId: msg.collectionId,
                         objectId: msg.id,
@@ -1053,18 +1074,62 @@ class SafeServer {
                 break;
             }
 
+            case "delete": {
+                if (!user) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
+                    return;
+                }
+
+                if (!tablePermission!.canDelete) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to delete from table" });
+                    break;
+                }
+
+                const collectionPermission = await this.prisma.groupCollection.findFirst({
+                    where: {
+                        collection: {
+                            objects: {
+                                some: {
+                                    objectId: msg.id,
+                                },
+                            },
+                        },
+                        group: {
+                            users: {
+                                some: {
+                                    userId: user.id,
+                                },
+                            },
+                        },
+                        canRemove: true,
+                    },
+                    select: {
+                        canRemove: true,
+                    },
+                });
+
+                if (!collectionPermission) {
+                    wsUser.send({ type: "error-response", request: msg.request, message: "Not allowed to remove from collection" });
+                    break;
+                }
+
+                await this.prisma.object.delete({
+                    where: {
+                        id: msg.id,
+                        tableName: msg.tableName,
+                    },
+                });
+
+                wsUser.send({ type: "delete-response", request: msg.request });
+                break;
+            }
+
             case "update": {
                 await this.lock.acquire(String(msg.id), async () => {
                     if (!user) {
                         wsUser.send({ type: "error-response", request: msg.request, message: "Unauthenticated" });
                         return;
                     }
-
-                    // const objectType = this.getType(msg.tableName);
-                    // if (!objectType) {
-                    //     wsUser.send({ type: "error-response", request: msg.request, message: "Unknown type" });
-                    //     return;
-                    // }
 
                     if (!tablePermission!.canUpdate) {
                         wsUser.send({ type: "error-response", request: msg.request, message: "Not allow to update data" });
@@ -1632,14 +1697,14 @@ class SafeServer {
 
                 const collectionPermission = await this.prisma.groupCollection.findFirst({
                     where: {
-                        // collection: {
-                        //     objects: {
-                        //         some: {
-                        //             objectId: msg.id,
-                        //         },
-                        //     },
-                        // },
-                        collectionId: msg.collectionId,
+                        collection: {
+                            objects: {
+                                some: {
+                                    objectId: msg.id,
+                                },
+                            },
+                        },
+                        // collectionId: msg.collectionId,
                         group: {
                             users: {
                                 some: {
@@ -2287,7 +2352,7 @@ class Collection {
             type: "get",
             tableName: tableName,
             id: id,
-            collectionId: this.id,
+            // collectionId: this.id,
         });
         if (res.type !== "get-response") {
             throw new Error();
@@ -2391,7 +2456,7 @@ class Collection {
         //     throw new Error("Cannot update, no key");
         // }
 
-        const getResponse = await this.client.request({ type: "get", tableName: tableName, id: id, collectionId: this.id });
+        const getResponse = await this.client.request({ type: "get", tableName: tableName, id: id /*collectionId: this.id*/ });
         if (getResponse.type !== "get-response") throw new Error();
 
         if (!getResponse.collectionId || !getResponse.encryptedObjectKeyBase64 || !getResponse.nonceBase64) {
@@ -2505,6 +2570,55 @@ class Collection {
 
         return rows;
     }
+
+    async link(tableName: string, objectId: number, columnsToShare: string[]) {
+        const getRes = await this.client.request({
+            type: "get",
+            tableName: tableName,
+            id: objectId,
+            // collectionId: this.id,
+        });
+        if (getRes.type !== "get-response") {
+            throw new Error();
+        }
+
+        if (!getRes.collectionId || !getRes.encryptedObjectKeyBase64) {
+            throw new Error("Object to add not found or no access");
+        }
+
+        const srcCollection = await this.client.getCollection(getRes.collectionId);
+        if (!srcCollection) {
+            throw new Error("Object source collection not found or no access");
+        }
+
+        const srcEncryptedObjectKeyBase64 = decodeBase64(getRes.encryptedObjectKeyBase64);
+        const objectKey = sodium.crypto_box_seal_open(srcEncryptedObjectKeyBase64, srcCollection.#publicKey, srcCollection.#privateKey);
+
+        const destEncryptedObjectKeyBase64 = sodium.crypto_box_seal(objectKey, this.#publicKey);
+
+        const res = await this.client.request({
+            type: "share",
+            tableName: tableName,
+            id: objectId,
+            collectionId: this.id,
+            encryptedObjectKeyBase64: encodeBase64(destEncryptedObjectKeyBase64),
+        });
+        if (res.type !== "share-response") {
+            throw new Error();
+        }
+    }
+
+    async unlink(tableName: string, objectId: number) {
+        const res = await this.client.request({
+            tableName: tableName,
+            type: "unshare",
+            id: objectId,
+            collectionId: this.id,
+        });
+        if (res.type !== "unshare-response") {
+            throw new Error();
+        }
+    }
 }
 
 function zodToType<K extends string, Schema extends z.ZodObject<{ public: z.ZodType; private: z.ZodType }>>(
@@ -2544,18 +2658,21 @@ async function main() {
     const server = new SafeServer(settings);
     await server.initialize();
 
-    const client = new SafeClient("ws://localhost:8080", settings);
+    const user1 = new SafeClient("ws://localhost:8080", settings);
+    const user2 = new SafeClient("ws://localhost:8080", settings);
 
-    await client.login("stijn4", "Vrijdag1@");
+    await user1.login("stijn4", "Vrijdag1@");
+    await user2.login("stijn5", "Vrijdag1@");
 
-    const col = await client.getPersonalCollection();
+    const col = await user1.getPersonalCollection();
 
     const profiles = await col.query("Profile", {});
     // console.log(profiles);
 
     // const profile = await col.get<{ note: string }, { name: string; email: string; age: number }>("Profile", 3);
+    let profile: any;
     if (profiles.length <= 0) {
-        const id = await col.create("Profile", {
+        profile = {
             private: {
                 name: "stijn rogiest",
                 email: "reddusted@gmail.com",
@@ -2564,21 +2681,28 @@ async function main() {
             public: {
                 note: "oof",
             },
-        });
+        };
+        const id = await col.create("Profile", profile);
         console.log("created profile with id", id);
     } else {
-        const profile = profiles[0]!;
+        profile = profiles[0]!;
         console.log("profile", profile);
-        await col.update("Profile", profile.id, {
-            private: {
-                ...profile.private,
-                age: profile.private.age + 1,
-            },
-            public: {
-                note: "updated",
-            },
-        });
     }
+
+    if (!profile.private.postsCollectionId) {
+        profile.private.postsCollectionId = (await user1.createCollection("Posts")).id;
+    }
+
+    profile.private.age++;
+    await col.update("Profile", profile.id, profile);
+
+    const postsCollection = (await user1.getCollection(profile.private.postsCollectionId))!;
+    const newPost = await col.create("Post", { private: { content: "hallo dit ben ik" }, public: {} });
+    await postsCollection.link("Post", newPost, []);
+
+    console.log("posts", await postsCollection.query("Post", {}));
+
+    // const newPost =
 }
 
 main();
